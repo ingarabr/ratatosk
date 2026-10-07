@@ -61,9 +61,9 @@ struct LiveSession {
 
 pub fn load() -> Result<Vec<Session>> {
     let out = Command::new("claude")
-        .args(["agents", "--json"])
+        .args(["agents", "--json", "--all"])
         .output()
-        .context("could not run `claude agents --json`")?;
+        .context("could not run `claude agents --json --all`")?;
     ensure!(
         out.status.success(),
         "`claude agents --json` failed: {}",

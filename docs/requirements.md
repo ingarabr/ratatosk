@@ -119,7 +119,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
 
 ## Data sources
 
-- `claude agents --json [--all]` is the supported interface and the ground truth. In 2.1.292 it has id, name, cwd, kind, state, status, pid, sessionId and startedAt. The docs mention `waitingFor`, but this build doesn't output it.
+- `claude agents --json --all` is the supported interface and the ground truth. Without `--all` it leaves out completed sessions, which the agents view still lists in its "Completed" group. In 2.1.292 it has id, name, cwd, kind, state, status, pid, sessionId and startedAt. The docs mention `waitingFor`, but this build doesn't output it.
 - `~/.claude/sessions/<pid>.json` gives the live working directory, status and name. Watch it for changes and reconcile against `claude agents --json`.
 - The docs say not to parse `~/.claude/jobs/<id>/state.json`, so use it as optional extra detail only. Its `detail` field is the one-line status the agents view shows ("awaiting go-ahead to push"), and the details pane uses it when it can be read.
 - Never talk to the daemon's `control.sock`. Its protocol is private and authenticated.
