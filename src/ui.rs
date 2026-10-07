@@ -1,0 +1,794 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use ratatui::{
+    Frame,
+    layout::{Constraint, Flex, Layout, Rect},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line as TextLine, Span},
+    widgets::{
+        Block, Borders, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Table, Wrap,
+    },
+};
+
+use crate::{
+    agents::State,
+    app::{App, Focus, Line},
+    launch::{Draft, Field, Repo, Target},
+    picker::{Item, Picker},
+    place::{Place, Scope},
+};
+
+const PLACEHOLDER: &str = "describe a task for a new session";
+// Nerd Font octicon git-branch; Ghostty bundles the Nerd Font symbols.
+const WORKTREE: &str = "\u{f418}";
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let has_detail = app
+        .selected_session_index()
+        .is_some_and(|i| app.sessions[i].detail.is_some());
+    let details_height = match frame.area().height >= DETAILS_FROM_HEIGHT {
+        false => 0,
+        true if has_detail => DETAILS_HEIGHT,
+        true => DETAILS_HEIGHT - 2,
+    };
+    let [details, body, prompt, hints] = Layout::vertical([
+        Constraint::Length(details_height),
+        Constraint::Fill(1),
+        Constraint::Length(3),
+        Constraint::Length(2),
+    ])
+    .areas(frame.area());
+    if details_height > 0 {
+        draw_details(frame, app, details);
+    }
+    if body.width >= MENU_FROM_WIDTH {
+        let [menu, list] =
+            Layout::horizontal([Constraint::Length(MENU_WIDTH), Constraint::Fill(1)]).areas(body);
+        draw_menu(frame, app, menu);
+        draw_sessions(frame, app, list);
+    } else {
+        draw_sessions(frame, app, body);
+    }
+    draw_prompt(frame, app, prompt);
+    draw_hints(frame, app, hints);
+    if let Some(draft) = &app.draft {
+        draw_draft(frame, app, draft);
+    }
+}
+
+const MENU_WIDTH: u16 = 28;
+const MENU_FROM_WIDTH: u16 = 90;
+
+fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Menu;
+    let block = Block::bordered()
+        .title(" projects ".dim())
+        .border_style(if focused {
+            Style::new().fg(Color::Cyan)
+        } else {
+            Style::new()
+        });
+    let lines: Vec<TextLine> = app
+        .scopes
+        .iter()
+        .map(|scope| {
+            let (indent, label, style) = match scope {
+                Scope::All => ("", tilde(&app.base.to_string_lossy()), Style::new()),
+                Scope::Org(org) => (
+                    " ",
+                    org.clone(),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Scope::Repo { repo, .. } => ("   ", repo.clone(), Style::new()),
+                Scope::Outside => (
+                    " ",
+                    "not in a repo".to_string(),
+                    Style::new().fg(Color::Yellow),
+                ),
+            };
+            let line = TextLine::from(vec![
+                Span::raw(indent),
+                Span::styled(label, style),
+                Span::raw(format!(" {}", app.scope_count(scope))).dim(),
+            ]);
+            match (*scope == app.scope, focused) {
+                (true, true) => line.patch_style(Style::new().add_modifier(Modifier::REVERSED)),
+                (true, false) => line.patch_style(Style::new().fg(Color::Cyan)),
+                _ => line,
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
+    let title = TextLine::from(vec![
+        " ratatosk ".bold(),
+        Span::raw(format!("{} sessions · ", app.sessions.len())).dim(),
+        Span::styled(
+            format!("{} need you", app.count(State::Blocked)),
+            state_style(State::Blocked),
+        ),
+        Span::raw(" · ").dim(),
+        Span::styled(
+            format!("{} working ", app.count(State::Working)),
+            state_style(State::Working),
+        ),
+    ]);
+
+    let rows = app.lines.iter().map(|line| match line {
+        Line::Header(group) => {
+            Row::new(vec![Cell::from(group.as_str()).style(
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )])
+        }
+        Line::Session(i) => {
+            let session = &app.sessions[*i];
+            Row::new(vec![
+                Cell::from(TextLine::from(vec![
+                    Span::raw("  "),
+                    Span::styled(session.state.glyph(), state_style(session.state)),
+                    Span::raw(" "),
+                    Span::raw(session.name.as_str()),
+                ])),
+                Cell::from(if app.places[*i].worktree().is_some() {
+                    WORKTREE
+                } else {
+                    ""
+                })
+                .fg(Color::Cyan),
+                Cell::from(age(session.started_at_ms)).dim(),
+            ])
+        }
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Length(5),
+        ],
+    )
+    .block(
+        Block::bordered()
+            .title(title)
+            .border_style(if app.focus == Focus::List {
+                Style::new().fg(Color::Cyan)
+            } else {
+                Style::new()
+            }),
+    )
+    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+    .highlight_symbol("❯ ")
+    .highlight_spacing(HighlightSpacing::Always);
+    frame.render_stateful_widget(table, area, &mut app.table);
+}
+
+const DETAILS_HEIGHT: u16 = 6;
+const DETAILS_FROM_HEIGHT: u16 = 20;
+const LABEL: usize = 9;
+
+fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(i) = app.selected_session_index() else {
+        frame.render_widget(Block::bordered().title(" no session selected ".dim()), area);
+        return;
+    };
+    let session = &app.sessions[i];
+    let block = Block::bordered()
+        .title(TextLine::from(vec![
+            Span::raw(format!(" {} ", session.name)).bold(),
+            Span::styled(
+                format!("{} ", state_word(session.state)),
+                state_style(session.state),
+            ),
+        ]))
+        .title(
+            TextLine::from(match age(session.started_at_ms) {
+                age if age.is_empty() => format!(" {} ", session.id),
+                age => format!(" started {age} ago · {} ", session.id),
+            })
+            .dim()
+            .right_aligned(),
+        )
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    let label = |text: &'static str| Span::raw(format!("{text:<LABEL$}")).dim();
+
+    let location = match &app.places[i] {
+        Place::Repo {
+            org,
+            repo,
+            worktree,
+        } => {
+            let mut spans = vec![
+                label("repo"),
+                Span::raw(format!("{org}/{repo}")),
+                Span::raw("   "),
+            ];
+            spans.push(match worktree {
+                Some(name) => Span::raw(format!("{WORKTREE} {name}")).cyan(),
+                None => Span::raw("main checkout").dim(),
+            });
+            if let Some(branch) = &app.branches[i] {
+                spans.extend([
+                    Span::raw("   "),
+                    Span::raw("branch ").dim(),
+                    Span::raw(branch.clone()),
+                ]);
+            }
+            TextLine::from(spans)
+        }
+        Place::Outside => TextLine::from(vec![
+            label("repo"),
+            Span::raw("not in a repo").yellow(),
+            Span::raw(" · started outside the repos, so no repo skills or settings").dim(),
+        ]),
+    };
+    let mut lines = vec![
+        location,
+        TextLine::from(vec![
+            label("folder"),
+            Span::raw(tilde(&session.cwd.to_string_lossy())),
+        ]),
+    ];
+    if let Some(detail) = &session.detail {
+        let width = (inner.width as usize).saturating_sub(LABEL);
+        let heading = if session.state == State::Blocked {
+            "waiting"
+        } else {
+            "now"
+        };
+        for (n, text) in wrap_clipped(detail, width, 2).into_iter().enumerate() {
+            let head = if n == 0 {
+                label(heading)
+            } else {
+                Span::raw(" ".repeat(LABEL))
+            };
+            lines.push(TextLine::from(vec![head, Span::raw(text)]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn wrap_clipped(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut words = text.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if Span::raw(candidate.as_str()).width() <= width {
+            current = candidate;
+            continue;
+        }
+        if lines.len() + 1 == max_lines {
+            lines.push(ellipsize(&candidate, width));
+            return lines;
+        }
+        lines.push(std::mem::replace(&mut current, word.to_string()));
+        if words.peek().is_none() && lines.len() == max_lines {
+            break;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn ellipsize(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if Span::raw(format!("{out}{c}…")).width() > width {
+            break;
+        }
+        out.push(c);
+    }
+    format!("{}…", out.trim_end())
+}
+
+fn state_word(state: State) -> &'static str {
+    match state {
+        State::Working => "working",
+        State::Blocked => "needs you",
+        State::Done => "done",
+        State::Unknown => "unknown",
+    }
+}
+
+fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).dim();
+    let inner = block.inner(area);
+    let room = (inner.width as usize).saturating_sub(3);
+    let shown = if app.input.is_empty() {
+        Span::raw(PLACEHOLDER).dim()
+    } else if Span::raw(app.input.as_str()).width() <= room {
+        Span::raw(app.input.clone())
+    } else {
+        let tail: String = app
+            .input
+            .chars()
+            .rev()
+            .take(room.saturating_sub(1))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Span::raw(format!("…{tail}"))
+    };
+    let typed = if app.input.is_empty() {
+        0
+    } else {
+        shown.width() as u16
+    };
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(TextLine::from(vec![Span::raw("❯ ").dim(), shown])),
+        inner,
+    );
+    if app.draft.is_none() {
+        frame.set_cursor_position((inner.x + 2 + typed, inner.y));
+    }
+}
+
+fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
+    let message = |text: &str, style: Style| {
+        Paragraph::new(text.to_string())
+            .style(style)
+            .wrap(Wrap { trim: true })
+    };
+    if let Some(err) = &app.error {
+        frame.render_widget(message(err, Style::new().fg(Color::Red)), area);
+        return;
+    }
+    if let Some(status) = &app.status {
+        frame.render_widget(message(status, Style::new().fg(Color::Yellow)), area);
+        return;
+    }
+    let hints: [&str; 2] = if app.focus == Focus::Menu {
+        [
+            "↑↓ to pick a project · the list follows",
+            "→ or enter to go back to the list",
+        ]
+    } else if app.input.is_empty() {
+        [
+            "↑↓ to select · enter to attach · ← for projects · ctrl+z in a session to come back",
+            "ctrl+x to stop, twice to delete · type to start a session · esc to quit",
+        ]
+    } else {
+        ["enter to review and start", "esc to clear"]
+    };
+    frame.render_widget(
+        Paragraph::new(hints.map(TextLine::from).to_vec()).dim(),
+        area,
+    );
+}
+
+const PICKER_ROWS: usize = 12;
+
+fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
+    let repos = &app.repos;
+    let target = draft.target.as_ref();
+    let launch = draft.launch(&app.base, repos);
+    let picking = draft.field == Field::Project;
+
+    let field = |which: Field, label: &str, value: Option<String>| {
+        let focused = draft.field == which;
+        let value = match value {
+            Some(v) if focused && which != Field::Project => Span::styled(
+                format!("‹ {v} ›"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Some(v) => Span::styled(v, Style::new().add_modifier(Modifier::BOLD)),
+            None => Span::styled("pick one", Style::new().fg(Color::Yellow)),
+        };
+        TextLine::from(vec![
+            Span::raw(if focused { "❯ " } else { "  " }),
+            Span::raw(format!("{label:<9}")).dim(),
+            value,
+        ])
+    };
+
+    let mut lines = vec![
+        TextLine::from(vec![
+            Span::raw("  prompt   ").dim(),
+            Span::raw(draft.prompt.as_str()),
+        ]),
+        TextLine::default(),
+        field(Field::Project, "project", target.map(|t| t.label(repos))),
+    ];
+    let mut cursor = None;
+    if picking {
+        let filter_line = TextLine::from(vec![
+            Span::raw("           "),
+            Span::styled("filter ", Style::new().fg(Color::Cyan)),
+            Span::raw(draft.picker.filter.as_str()),
+        ]);
+        cursor = Some((
+            lines.len(),
+            18 + TextLine::from(draft.picker.filter.as_str()).width(),
+        ));
+        lines.push(filter_line);
+        lines.extend(picker_lines(&draft.picker, repos));
+    }
+    lines.push(field(
+        Field::Model,
+        "model",
+        draft.model.map(|m| m.label().to_string()),
+    ));
+    lines.push(field(
+        Field::Effort,
+        "effort",
+        draft.effort.map(|e| e.label().to_string()),
+    ));
+    lines.push(TextLine::default());
+    let starts_in = match (&launch, target) {
+        (Some(l), _) => format!(
+            "{}{}",
+            tilde(&l.dir.to_string_lossy()),
+            if l.create { "  (new folder)" } else { "" }
+        ),
+        (None, Some(Target::Repo(i))) => tilde(&repos[*i].dir.to_string_lossy()),
+        _ => String::new(),
+    };
+    lines.push(TextLine::from(vec![
+        Span::raw("  starts in ").dim(),
+        Span::raw(starts_in),
+    ]));
+    lines.push(TextLine::from(vec![
+        Span::raw("  runs      ").dim(),
+        Span::raw(
+            launch
+                .map(|l| format!("claude {}", shell_words(&l.args())))
+                .unwrap_or_default(),
+        )
+        .dim(),
+    ]));
+    if draft.manual(repos) {
+        lines.push(
+            TextLine::from(
+                "  pick the model and effort yourself for this project (manualModel in the config)",
+            )
+            .yellow(),
+        );
+    }
+    if let Some(notice) = &draft.notice {
+        lines.push(TextLine::from(format!("  {notice}")).red());
+    }
+    lines.push(TextLine::default());
+    lines.push(
+        TextLine::from(if picking {
+            "  type to filter · ↑↓ move · → open · ← close · enter to pick · tab to next field · esc back"
+        } else {
+            "  ↑↓ or tab field · ←→ change · enter to start · ctrl+enter to start and open · esc back"
+        })
+        .dim(),
+    );
+
+    let area = centered(frame.area(), 100, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Start this session? ".bold())
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        area,
+    );
+    if let Some((row, col)) = cursor {
+        frame.set_cursor_position((area.x + 1 + col as u16, area.y + 1 + row as u16));
+    }
+}
+
+fn picker_lines<'a>(picker: &Picker, repos: &'a [Repo]) -> Vec<TextLine<'a>> {
+    let items = picker.items(repos);
+    if items.is_empty() {
+        return vec![
+            TextLine::from("             no matches; type a folder name to create one").dim(),
+        ];
+    }
+    let first = picker
+        .cursor
+        .saturating_sub(PICKER_ROWS - 1)
+        .min(items.len().saturating_sub(PICKER_ROWS));
+    items
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(PICKER_ROWS)
+        .map(|(i, item)| {
+            let line = match item {
+                Item::Heading(text) => TextLine::from(format!("           {text}"))
+                    .style(Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC)),
+                Item::Recent(r) => TextLine::from(format!("             {}", repos[*r].label())),
+                Item::Org { name, count, open } => TextLine::from(vec![
+                    Span::raw(format!("             {} ", if *open { "▾" } else { "▸" })),
+                    Span::styled(name.clone(), Style::new().fg(Color::Yellow)),
+                    Span::raw(format!("  {count}")).dim(),
+                ]),
+                Item::Repo(r) if picker.filtering() => {
+                    TextLine::from(format!("             {}", repos[*r].label()))
+                }
+                Item::Repo(r) => TextLine::from(format!("                 {}", repos[*r].name)),
+                Item::Create { org, name } => {
+                    TextLine::from(format!("             + new folder {org}/{name}"))
+                        .style(Style::new().fg(Color::Green))
+                }
+            };
+            if i == picker.cursor {
+                line.patch_style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [area] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(area);
+    area
+}
+
+fn tilde(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
+        _ => path.to_string(),
+    }
+}
+
+fn shell_words(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.contains(char::is_whitespace) || a.is_empty() {
+                format!("{a:?}")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn state_style(state: State) -> Style {
+    match state {
+        State::Working => Style::new().fg(Color::Green),
+        State::Blocked => Style::new().fg(Color::Yellow),
+        State::Done | State::Unknown => Style::new().fg(Color::DarkGray),
+    }
+}
+
+fn age(started_at_ms: Option<u64>) -> String {
+    let Some(started) = started_at_ms else {
+        return String::new();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(started, |d| d.as_millis() as u64);
+    let minutes = now.saturating_sub(started) / 60_000;
+    match minutes {
+        m if m < 60 => format!("{m}m"),
+        m if m < 60 * 24 => format!("{}h", m / 60),
+        m => format!("{}d", m / (60 * 24)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ratatui::{Terminal, backend::TestBackend, widgets::TableState};
+
+    use super::*;
+    use crate::agents::Session;
+
+    fn app() -> App {
+        App {
+            base: PathBuf::from("/p"),
+            sessions: vec![Session {
+                id: "a1".into(),
+                name: "billing: credit-note".into(),
+                state: State::Done,
+                cwd: PathBuf::from("/p/acme/billing/.claude/worktrees/credit-note-api"),
+                started_at_ms: None,
+                detail: Some("awaiting go-ahead to push".into()),
+            }],
+            places: vec![Place::Repo {
+                org: "acme".into(),
+                repo: "billing".into(),
+                worktree: Some("credit-note-api".into()),
+            }],
+            branches: vec![Some("credit-note-api".into())],
+            lines: vec![Line::Header("acme / billing".into()), Line::Session(0)],
+            table: TableState::default().with_selected(Some(1)),
+            error: None,
+            repos: vec![Repo {
+                org: "globex".into(),
+                name: "engine".into(),
+                dir: PathBuf::from("/p/globex/engine"),
+            }],
+            input: String::new(),
+            draft: None,
+            recent_path: None,
+            status: None,
+            armed_delete: None,
+            focus: Focus::List,
+            scopes: vec![Scope::All],
+            scope: Scope::All,
+            manual_model: Default::default(),
+        }
+    }
+
+    fn screen(app: &mut App) -> String {
+        screen_at(app, 120)
+    }
+
+    fn screen_at(app: &mut App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn group_and_full_session_names_are_drawn() {
+        let screen = screen(&mut app());
+        assert!(screen.contains("acme / billing"), "{screen}");
+        assert!(screen.contains("billing: credit-note"), "{screen}");
+        assert!(screen.contains(WORKTREE), "{screen}");
+        assert!(screen.contains(PLACEHOLDER), "{screen}");
+    }
+
+    #[test]
+    fn details_show_what_the_session_waits_for_and_where_it_runs() {
+        let screen = screen(&mut app());
+        assert!(screen.contains("awaiting go-ahead to push"), "{screen}");
+        assert!(screen.contains("acme/billing"), "{screen}");
+        assert!(screen.contains("credit-note-api"), "{screen}");
+        assert!(screen.contains("a1"), "{screen}");
+    }
+
+    #[test]
+    fn long_status_is_cut_to_two_lines() {
+        let lines = wrap_clipped(&"word ".repeat(40), 30, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'), "{lines:?}");
+        assert!(
+            lines.iter().all(|l| Span::raw(l.as_str()).width() <= 30),
+            "{lines:?}"
+        );
+        assert_eq!(wrap_clipped("short status", 30, 2), ["short status"]);
+    }
+
+    #[test]
+    fn a_long_prompt_shows_its_end() {
+        let mut app = app();
+        app.input = format!("{} the end", "x".repeat(200));
+        let screen = screen(&mut app);
+        assert!(screen.contains("…"), "{screen}");
+        assert!(screen.contains("the end"), "{screen}");
+    }
+
+    #[test]
+    fn project_picker_shows_filter_tree_and_new_folder_option() {
+        let mut app = app();
+        app.input = "start a tool".into();
+        app.draft = Some(Draft::new(
+            app.input.clone(),
+            None,
+            Vec::new(),
+            &app.repos,
+            Default::default(),
+        ));
+        let before = screen(&mut app);
+        assert!(before.contains("filter"), "{before}");
+        assert!(before.contains("all projects"), "{before}");
+        assert!(before.contains("▸ globex"), "{before}");
+
+        let repos = app.repos.clone();
+        let draft = app.draft.as_mut().unwrap();
+        for c in "newtool".chars() {
+            draft.picker.type_char(&repos, c);
+        }
+        let after = screen(&mut app);
+        assert!(after.contains("+ new folder globex/newtool"), "{after}");
+    }
+
+    #[test]
+    fn confirmation_shows_the_command_it_will_run() {
+        let mut app = app();
+        app.input = "fix the parser".into();
+        app.draft = Some(Draft::new(
+            app.input.clone(),
+            Some(Target::Repo(0)),
+            Vec::new(),
+            &app.repos,
+            Default::default(),
+        ));
+        let screen = screen(&mut app);
+        assert!(screen.contains("Start this session?"), "{screen}");
+        assert!(screen.contains("globex/engine"), "{screen}");
+        assert!(
+            screen.contains("claude --bg \"fix the parser\""),
+            "{screen}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use std::path::{Path, PathBuf};
+
+    use ratatui::{Terminal, backend::TestBackend, widgets::TableState};
+
+    use super::*;
+    use crate::agents::Session;
+
+    fn session(id: &str, name: &str, cwd: &str) -> Session {
+        Session {
+            id: id.into(),
+            name: name.into(),
+            state: State::Done,
+            cwd: PathBuf::from(cwd),
+            started_at_ms: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn menu_lists_projects_with_counts() {
+        let sessions = vec![
+            session("a", "billing: one", "/p/acme/billing"),
+            session("b", "engine: two", "/p/globex/engine"),
+        ];
+        let places: Vec<Place> = sessions
+            .iter()
+            .map(|s| Place::of(Path::new("/p"), &s.cwd))
+            .collect();
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            scopes: Scope::for_places(&places),
+            branches: vec![None, None],
+            lines: vec![Line::Header("acme / billing".into()), Line::Session(0)],
+            places,
+            sessions,
+            table: TableState::default().with_selected(Some(1)),
+            error: None,
+            repos: Vec::new(),
+            input: String::new(),
+            draft: None,
+            recent_path: None,
+            status: None,
+            armed_delete: None,
+            manual_model: Default::default(),
+            focus: Focus::Menu,
+            scope: Scope::Org("acme".into()),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("projects"), "{screen}");
+        assert!(screen.contains("engine 1"), "{screen}");
+        assert!(screen.contains("acme 1"), "{screen}");
+        assert!(screen.contains("↑↓ to pick a project"), "{screen}");
+    }
+}

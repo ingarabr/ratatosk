@@ -1,0 +1,7 @@
+{
+  "baseDir": "~/projects",
+  "manualModel": {
+    "orgs": ["acme"],
+    "promptWords": ["acme"]
+  }
+}
