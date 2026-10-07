@@ -6,11 +6,17 @@ mod launch;
 mod names;
 mod picker;
 mod place;
+mod pr;
 mod recent;
 mod state;
 mod ui;
 
-use std::{io::stdout, path::Path, process::Command};
+use std::{
+    io::stdout,
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use ratatui::{
@@ -30,8 +36,13 @@ use app::{Action, App, Line};
 fn main() -> Result<()> {
     let config = config::Config::load()?;
     let base = config.base_dir()?;
-    let app = App::new(base, config.manual_model);
+    let mut app = App::new(base, config.manual_model);
+    app.request_prs(Instant::now());
     if std::env::args().nth(1).as_deref() == Some("--list") {
+        while app.prs_pending() {
+            app.receive_prs();
+            std::thread::sleep(Duration::from_millis(50));
+        }
         return print_list(app);
     }
     let mut terminal = init()?;
@@ -63,14 +74,28 @@ fn restore() {
 fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        app.receive_prs();
+        // Poll only while a PR lookup is out, so its results can redraw the list.
+        let timeout = if app.prs_pending() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(3600)
+        };
+        if !event::poll(timeout)? {
+            continue;
+        }
         match event::read()? {
-            Event::FocusGained => app.refresh(),
+            Event::FocusGained => {
+                app.refresh();
+                app.request_prs(Instant::now());
+            }
             Event::Key(key) if key.kind == KeyEventKind::Press => match app.on_key(key) {
                 Action::Quit => return Ok(()),
                 Action::Attach { id, cwd } => {
                     let dir = if cwd.is_dir() { cwd } else { app.base.clone() };
                     attach(terminal, &id, &dir)?;
                     app.refresh();
+                    app.request_prs(Instant::now());
                 }
                 Action::Start { launch, open } => match launch.start() {
                     Ok(stdout) => {
@@ -167,7 +192,12 @@ fn print_list(app: App) -> Result<()> {
                     .worktree()
                     .map(|w| format!("  [{w}]"))
                     .unwrap_or_default();
-                println!("  {} {}{worktree}", session.state.glyph(), session.name);
+                let pr: String = app
+                    .prs_for(*i)
+                    .iter()
+                    .map(|pr| format!("  #{} {:?}", pr.number, pr.state))
+                    .collect();
+                println!("  {} {}{worktree}{pr}", session.state.glyph(), session.name);
             }
         }
     }

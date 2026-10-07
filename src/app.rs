@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::mpsc::{Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -16,11 +17,13 @@ use crate::{
     launch::{self, Draft, Field, Launch, Repo, Target},
     names,
     place::{Place, Scope},
+    pr::{self, Pr, PrState, RepoPrs},
     recent,
 };
 
 const RECENT_SHOWN: usize = 6;
 const DELETE_WINDOW: Duration = Duration::from_secs(2);
+const PR_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
@@ -66,6 +69,10 @@ pub struct App {
     pub names: HashMap<String, String>,
     pub claude_names: HashMap<String, String>,
     pub renaming: Option<(String, String)>,
+    pub prs: HashMap<String, RepoPrs>,
+    pub dir_repos: HashMap<PathBuf, String>,
+    pub pr_lookup: Option<Receiver<pr::Found>>,
+    pub prs_requested: Option<Instant>,
 }
 
 impl App {
@@ -92,6 +99,10 @@ impl App {
             names_path: names::path(),
             claude_names: HashMap::new(),
             renaming: None,
+            prs: HashMap::new(),
+            dir_repos: HashMap::new(),
+            pr_lookup: None,
+            prs_requested: None,
         };
         app.refresh();
         app
@@ -319,6 +330,99 @@ impl App {
         self.layout(Some(id));
     }
 
+    pub fn repo_dir(&self, i: usize) -> Option<PathBuf> {
+        match &self.places[i] {
+            Place::Repo { org, repo, .. } => Some(self.base.join(org).join(repo)),
+            Place::Outside => None,
+        }
+    }
+
+    pub fn prs_for(&self, i: usize) -> Vec<Pr> {
+        let known = |repo: &str, number: u64| {
+            self.prs
+                .get(&repo.to_lowercase())
+                .and_then(|p| p.by_number.get(&number))
+                .cloned()
+        };
+        let mut prs: Vec<Pr> = self.sessions[i]
+            .prs
+            .iter()
+            .map(|r| {
+                known(&r.repo, r.number).unwrap_or(Pr {
+                    number: r.number,
+                    state: PrState::Unknown,
+                    title: String::new(),
+                })
+            })
+            .collect();
+        if prs.is_empty()
+            && let (Some(dir), Some(Some(branch))) = (self.repo_dir(i), self.branches.get(i))
+            && let Some(repo) = self.dir_repos.get(&dir).and_then(|name| self.prs.get(name))
+            && let Some(pr) = repo
+                .by_branch
+                .get(branch)
+                .and_then(|n| repo.by_number.get(n))
+        {
+            prs.push(pr.clone());
+        }
+        prs.dedup_by_key(|pr| pr.number);
+        prs
+    }
+
+    pub fn request_prs(&mut self, now: Instant) {
+        let recent = self
+            .prs_requested
+            .is_some_and(|at| now.duration_since(at) < PR_MIN_INTERVAL);
+        if self.pr_lookup.is_some() || recent {
+            return;
+        }
+        let mut repos: Vec<PathBuf> = (0..self.sessions.len())
+            .filter_map(|i| self.repo_dir(i))
+            .collect();
+        repos.sort();
+        repos.dedup();
+        if repos.is_empty() && self.sessions.iter().all(|s| s.prs.is_empty()) {
+            return;
+        }
+        let linked: Vec<(String, u64)> = self
+            .sessions
+            .iter()
+            .flat_map(|s| s.prs.iter().map(|r| (r.repo.clone(), r.number)))
+            .collect();
+        self.prs_requested = Some(now);
+        self.pr_lookup = Some(pr::look_up(repos, linked));
+    }
+
+    pub fn receive_prs(&mut self) -> bool {
+        let Some(rx) = &self.pr_lookup else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok((dir, Ok(prs))) => {
+                    let name = prs.repo.to_lowercase();
+                    if let Some(dir) = dir {
+                        self.dir_repos.insert(dir, name.clone());
+                    }
+                    self.prs.entry(name).or_default().merge(prs);
+                    changed = true;
+                }
+                Ok((_, Err(_))) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.pr_lookup = None;
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    pub fn prs_pending(&self) -> bool {
+        self.pr_lookup.is_some()
+    }
+
     pub fn stop_or_delete(&mut self, now: Instant) -> Action {
         let Some(id) = self.selected_session().map(|s| s.id.clone()) else {
             return Action::None;
@@ -496,6 +600,7 @@ mod tests {
                 cwd: PathBuf::from("/elsewhere"),
                 started_at_ms: None,
                 detail: None,
+                prs: Vec::new(),
             })
             .collect();
         App {
@@ -590,6 +695,7 @@ mod scope_tests {
                 cwd: PathBuf::from(cwd),
                 started_at_ms: None,
                 detail: None,
+                prs: Vec::new(),
             });
         }
         app.rebuild(None);
@@ -629,6 +735,7 @@ mod rename_tests {
             cwd: PathBuf::from("/elsewhere"),
             started_at_ms: None,
             detail: None,
+            prs: Vec::new(),
         });
         app.rebuild(None);
         app
@@ -675,5 +782,83 @@ mod rename_tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.sessions[0].name, "billing: credit-note");
         assert!(app.names.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pr_tests {
+    use super::*;
+    use crate::agents::PrRef;
+
+    fn app_with_repo_prs() -> App {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        app.sessions.push(Session {
+            id: "a1".into(),
+            name: "refunds".into(),
+            state: State::Done,
+            cwd: PathBuf::from("/p/acme/billing/.claude/worktrees/refunds"),
+            started_at_ms: None,
+            detail: None,
+            prs: Vec::new(),
+        });
+        app.places = vec![Place::of(&app.base, &app.sessions[0].cwd)];
+        app.branches = vec![Some("refunds".into())];
+        let mut repo = RepoPrs {
+            repo: "acme/billing".into(),
+            ..Default::default()
+        };
+        repo.by_branch.insert("refunds".into(), 11);
+        repo.by_number.insert(
+            11,
+            Pr {
+                number: 11,
+                state: PrState::Merged,
+                title: "Refunds".into(),
+            },
+        );
+        repo.by_number.insert(
+            12,
+            Pr {
+                number: 12,
+                state: PrState::Open,
+                title: "Payouts".into(),
+            },
+        );
+        app.dir_repos
+            .insert(PathBuf::from("/p/acme/billing"), "acme/billing".into());
+        app.prs.insert("acme/billing".into(), repo);
+        app
+    }
+
+    #[test]
+    fn without_links_a_session_finds_its_pr_by_branch() {
+        let app = app_with_repo_prs();
+        assert_eq!(
+            app.prs_for(0).iter().map(|p| p.number).collect::<Vec<_>>(),
+            [11]
+        );
+    }
+
+    #[test]
+    fn linked_prs_win_and_unknown_ones_keep_their_number() {
+        let mut app = app_with_repo_prs();
+        app.sessions[0].prs = vec![
+            PrRef {
+                repo: "acme/billing".into(),
+                number: 12,
+            },
+            PrRef {
+                repo: "acme/billing".into(),
+                number: 99,
+            },
+        ];
+        let prs = app.prs_for(0);
+        assert_eq!(
+            prs.iter().map(|p| (p.number, p.state)).collect::<Vec<_>>(),
+            [(12, PrState::Open), (99, PrState::Unknown)]
+        );
     }
 }

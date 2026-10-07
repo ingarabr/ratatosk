@@ -39,6 +39,27 @@ pub struct Session {
     pub cwd: PathBuf,
     pub started_at_ms: Option<u64>,
     pub detail: Option<String>,
+    pub prs: Vec<PrRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrRef {
+    pub repo: String,
+    pub number: u64,
+}
+
+impl PrRef {
+    fn from_href(href: &str) -> Option<Self> {
+        let path = href.strip_prefix("https://github.com/")?;
+        let mut parts = path.split('/');
+        let (owner, name, kind, number) =
+            (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+        (kind == "pull").then_some(())?;
+        Some(Self {
+            repo: format!("{owner}/{name}"),
+            number: number.parse().ok()?,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -75,18 +96,34 @@ pub fn load() -> Result<Vec<Session>> {
     let live = live_cwds();
     Ok(rows
         .into_iter()
-        .map(|row| Session {
-            cwd: row
-                .session_id
-                .as_deref()
-                .and_then(|id| live.get(id))
-                .cloned()
-                .unwrap_or(row.cwd),
-            name: row.name.unwrap_or_else(|| row.id.clone()),
-            detail: detail(&row.id),
-            id: row.id,
-            state: State::parse(row.state.as_deref()),
-            started_at_ms: row.started_at,
+        .map(|row| {
+            let job = job_state(&row.id);
+            Session {
+                cwd: row
+                    .session_id
+                    .as_deref()
+                    .and_then(|id| live.get(id))
+                    .cloned()
+                    .unwrap_or(row.cwd),
+                name: row.name.unwrap_or_else(|| row.id.clone()),
+                detail: job
+                    .as_ref()
+                    .and_then(|j| j.detail.clone())
+                    .filter(|d| !d.trim().is_empty()),
+                prs: job
+                    .as_ref()
+                    .map(|j| {
+                        j.children
+                            .iter()
+                            .filter(|c| c.kind == "pr")
+                            .filter_map(|c| PrRef::from_href(&c.href))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                id: row.id,
+                state: State::parse(row.state.as_deref()),
+                started_at_ms: row.started_at,
+            }
         })
         .collect())
 }
@@ -94,11 +131,20 @@ pub fn load() -> Result<Vec<Session>> {
 #[derive(Deserialize)]
 struct JobState {
     detail: Option<String>,
+    #[serde(default)]
+    children: Vec<JobChild>,
 }
 
-// The one-line status the agents view shows. It lives in the undocumented job state file,
-// so it is optional: any read or parse failure leaves it out.
-fn detail(id: &str) -> Option<String> {
+#[derive(Deserialize)]
+struct JobChild {
+    href: String,
+    kind: String,
+}
+
+// The agents view's own record of a session: its one-line status (`detail`) and the PRs it
+// found in the transcript (`children`). The file is undocumented, so a read or parse failure
+// just leaves both out.
+fn job_state(id: &str) -> Option<JobState> {
     let home = std::env::var_os("HOME")?;
     let bytes = fs::read(
         PathBuf::from(home)
@@ -107,10 +153,7 @@ fn detail(id: &str) -> Option<String> {
             .join("state.json"),
     )
     .ok()?;
-    serde_json::from_slice::<JobState>(&bytes)
-        .ok()?
-        .detail
-        .filter(|d| !d.trim().is_empty())
+    serde_json::from_slice(&bytes).ok()
 }
 
 pub fn stop(id: &str) -> Result<String> {
@@ -151,4 +194,28 @@ fn live_cwds() -> HashMap<String, PathBuf> {
         .filter_map(|bytes| serde_json::from_slice::<LiveSession>(&bytes).ok())
         .map(|session| (session.session_id, session.cwd))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_links_are_read_from_github_pull_urls() {
+        assert_eq!(
+            PrRef::from_href("https://github.com/acme/billing/pull/1931"),
+            Some(PrRef {
+                repo: "acme/billing".into(),
+                number: 1931
+            })
+        );
+        assert_eq!(
+            PrRef::from_href("https://github.com/acme/billing/issues/7"),
+            None
+        );
+        assert_eq!(
+            PrRef::from_href("https://gitlab.com/acme/billing/-/merge_requests/3"),
+            None
+        );
+    }
 }

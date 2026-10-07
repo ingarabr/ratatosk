@@ -88,12 +88,9 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
 
 ## PRs
 
-- A PR is linked to a session by:
-  - the open PR on the session's branch (`gh pr list --head`);
-  - PR numbers mentioned in the transcript;
-  - the branch the work was rebased onto.
-- Results are cached.
-- The icon shows the PR state: GitHub's octicons for open, draft, merged and closed. Ghostty draws these from its built-in Nerd Font symbols. The PR number sits next to the icon.
+- A session's PRs are the ones the agents view links to it: `children` entries of kind `pr` in `~/.claude/jobs/<id>/state.json`. The agents view fills these by scanning the session's transcript for PRs it created, checked out, edited, commented on or pushed to, so one session can have several and they can be in any repo. A session with none falls back to the open or latest PR on its branch.
+- PR state comes from `gh`, in the background: `gh pr list --state all` for each repo sessions run in and each repo a link points to, then `gh pr view` for linked PRs too old for that list. Lookups run at startup, on return from a session and when the window regains focus, at most once a minute.
+- The list shows GitHub's octicon for the state (open, draft, merged, closed) with the PR number, or "N PRs" coloured by the most relevant state. Ghostty draws the octicons from its built-in Nerd Font symbols. The details band lists every PR with its state, plus the title when there's one.
 - Show how many commits a PR is behind its base.
 - Actions:
   - review checks the PR out into a worktree, or onto a branch for `main-checkout` repos;

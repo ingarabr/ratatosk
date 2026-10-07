@@ -16,20 +16,34 @@ use crate::{
     launch::{Draft, Field, Repo, Target},
     picker::{Item, Picker},
     place::{Place, Scope},
+    pr::{Pr, PrState},
 };
 
 const PLACEHOLDER: &str = "describe a task for a new session";
 // Nerd Font octicon git-branch; Ghostty bundles the Nerd Font symbols.
 const WORKTREE: &str = "\u{f418}";
+// Nerd Font octicons for pull request states.
+const PR_OPEN: &str = "\u{f407}";
+const PR_DRAFT: &str = "\u{f4dd}";
+const PR_MERGED: &str = "\u{f419}";
+const PR_CLOSED: &str = "\u{f4dc}";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let has_detail = app
-        .selected_session_index()
-        .is_some_and(|i| app.sessions[i].detail.is_some());
-    let details_height = match frame.area().height >= DETAILS_FROM_HEIGHT {
-        false => 0,
-        true if has_detail => DETAILS_HEIGHT,
-        true => DETAILS_HEIGHT - 2,
+    let details_height = match (
+        frame.area().height >= DETAILS_FROM_HEIGHT,
+        app.selected_session_index(),
+    ) {
+        (true, Some(i)) => {
+            let detail = if app.sessions[i].detail.is_some() {
+                2
+            } else {
+                0
+            };
+            let pr = u16::from(!app.prs_for(i).is_empty());
+            4 + pr + detail
+        }
+        (true, None) => 3,
+        (false, _) => 0,
     };
     let [details, body, prompt, hints] = Layout::vertical([
         Constraint::Length(details_height),
@@ -102,34 +116,36 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
+    let mut state = std::mem::take(&mut app.table);
+    let view: &App = app;
     let title = TextLine::from(vec![
         " ratatosk ".bold(),
-        Span::raw(format!("{} sessions · ", app.sessions.len())).dim(),
+        Span::raw(format!("{} sessions · ", view.sessions.len())).dim(),
         Span::styled(
-            format!("{} need you", app.count(State::Blocked)),
+            format!("{} need you", view.count(State::Blocked)),
             state_style(State::Blocked),
         ),
         Span::raw(" · ").dim(),
         Span::styled(
-            format!("{} working ", app.count(State::Working)),
+            format!("{} working ", view.count(State::Working)),
             state_style(State::Working),
         ),
     ]);
 
-    let rows = app.lines.iter().map(|line| match line {
+    let rows = view.lines.iter().map(|line| match line {
         Line::Header(group) => {
             Row::new(vec![Cell::from(group.as_str()).style(
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             )])
         }
         Line::Session(i) => {
-            let session = &app.sessions[*i];
+            let session = &view.sessions[*i];
             Row::new(vec![
                 Cell::from(TextLine::from(vec![
                     Span::raw("  "),
                     Span::styled(session.state.glyph(), state_style(session.state)),
                     Span::raw(" "),
-                    match &app.renaming {
+                    match &view.renaming {
                         Some((id, buffer)) if *id == session.id => Span::styled(
                             format!("{buffer}▏"),
                             Style::new()
@@ -139,12 +155,13 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
                         _ => Span::raw(session.name.as_str()),
                     },
                 ])),
-                Cell::from(if app.places[*i].worktree().is_some() {
+                Cell::from(if view.places[*i].worktree().is_some() {
                     WORKTREE
                 } else {
                     ""
                 })
                 .fg(Color::Cyan),
+                Cell::from(prs_badge(&view.prs_for(*i))),
                 Cell::from(age(session.started_at_ms)).dim(),
             ])
         }
@@ -154,13 +171,14 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
         [
             Constraint::Fill(1),
             Constraint::Length(2),
+            Constraint::Length(8),
             Constraint::Length(5),
         ],
     )
     .block(
         Block::bordered()
             .title(title)
-            .border_style(if app.focus == Focus::List {
+            .border_style(if view.focus == Focus::List {
                 Style::new().fg(Color::Cyan)
             } else {
                 Style::new()
@@ -169,10 +187,10 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
     .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
     .highlight_symbol("❯ ")
     .highlight_spacing(HighlightSpacing::Always);
-    frame.render_stateful_widget(table, area, &mut app.table);
+    frame.render_stateful_widget(table, area, &mut state);
+    app.table = state;
 }
 
-const DETAILS_HEIGHT: u16 = 6;
 const DETAILS_FROM_HEIGHT: u16 = 20;
 const LABEL: usize = 9;
 
@@ -246,6 +264,24 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(tilde(&session.cwd.to_string_lossy())),
         ]),
     ];
+    let prs = app.prs_for(i);
+    if !prs.is_empty() {
+        let mut spans = vec![label(if prs.len() == 1 { "pr" } else { "prs" })];
+        for (n, pr) in prs.iter().enumerate() {
+            if n > 0 {
+                spans.push(Span::raw("   "));
+            }
+            spans.extend(pr_badge(pr).spans);
+            spans.push(Span::styled(
+                format!(" {}", pr_word(pr.state)),
+                pr_style(pr.state),
+            ));
+            if prs.len() == 1 && !pr.title.is_empty() {
+                spans.push(Span::raw(format!(" · {}", pr.title)));
+            }
+        }
+        lines.push(TextLine::from(spans));
+    }
     if let Some(detail) = &session.detail {
         let width = (inner.width as usize).saturating_sub(LABEL);
         let heading = if session.state == State::Blocked {
@@ -578,6 +614,56 @@ fn shell_words(args: &[String]) -> String {
         .join(" ")
 }
 
+fn prs_badge(prs: &[Pr]) -> TextLine<'static> {
+    match prs {
+        [] => TextLine::default(),
+        [pr] => pr_badge(pr),
+        many => {
+            let lead = [
+                PrState::Open,
+                PrState::Draft,
+                PrState::Merged,
+                PrState::Closed,
+                PrState::Unknown,
+            ]
+            .into_iter()
+            .find(|state| many.iter().any(|pr| pr.state == *state))
+            .unwrap_or(PrState::Unknown);
+            TextLine::from(format!("{} PRs", many.len())).style(pr_style(lead))
+        }
+    }
+}
+
+fn pr_badge(pr: &Pr) -> TextLine<'static> {
+    let icon = match pr.state {
+        PrState::Open | PrState::Unknown => PR_OPEN,
+        PrState::Draft => PR_DRAFT,
+        PrState::Merged => PR_MERGED,
+        PrState::Closed => PR_CLOSED,
+    };
+    TextLine::from(format!("{icon} {}", pr.number)).style(pr_style(pr.state))
+}
+
+fn pr_style(state: PrState) -> Style {
+    match state {
+        PrState::Open => Style::new().fg(Color::Green),
+        PrState::Draft => Style::new().fg(Color::DarkGray),
+        PrState::Merged => Style::new().fg(Color::Magenta),
+        PrState::Closed => Style::new().fg(Color::Red),
+        PrState::Unknown => Style::new().add_modifier(Modifier::DIM),
+    }
+}
+
+fn pr_word(state: PrState) -> &'static str {
+    match state {
+        PrState::Open => "open",
+        PrState::Draft => "draft",
+        PrState::Merged => "merged",
+        PrState::Closed => "closed",
+        PrState::Unknown => "state unknown",
+    }
+}
+
 fn state_style(state: State) -> Style {
     match state {
         State::Working => Style::new().fg(Color::Green),
@@ -620,6 +706,7 @@ mod tests {
                 cwd: PathBuf::from("/p/acme/billing/.claude/worktrees/credit-note-api"),
                 started_at_ms: None,
                 detail: Some("awaiting go-ahead to push".into()),
+                prs: Vec::new(),
             }],
             places: vec![Place::Repo {
                 org: "acme".into(),
@@ -680,6 +767,54 @@ mod tests {
         assert!(screen.contains("acme/billing"), "{screen}");
         assert!(screen.contains("credit-note-api"), "{screen}");
         assert!(screen.contains("a1"), "{screen}");
+    }
+
+    #[test]
+    fn a_linked_pr_shows_in_the_list_and_details() {
+        let mut app = app();
+        app.dir_repos
+            .insert(PathBuf::from("/p/acme/billing"), "acme/billing".into());
+        app.prs.insert(
+            "acme/billing".into(),
+            crate::pr::RepoPrs {
+                repo: "acme/billing".into(),
+                by_branch: [("credit-note-api".to_string(), 2085)].into(),
+                by_number: [(
+                    2085,
+                    Pr {
+                        number: 2085,
+                        state: PrState::Open,
+                        title: "Track payouts".into(),
+                    },
+                )]
+                .into(),
+            },
+        );
+        let screen = screen(&mut app);
+        assert!(screen.contains(&format!("{PR_OPEN} 2085")), "{screen}");
+        assert!(screen.contains("open · Track payouts"), "{screen}");
+    }
+
+    #[test]
+    fn several_linked_prs_show_as_a_count() {
+        let mut app = app();
+        app.sessions[0].prs = vec![
+            crate::agents::PrRef {
+                repo: "acme/billing".into(),
+                number: 1,
+            },
+            crate::agents::PrRef {
+                repo: "acme/billing".into(),
+                number: 2,
+            },
+            crate::agents::PrRef {
+                repo: "acme/billing".into(),
+                number: 3,
+            },
+        ];
+        let screen = screen(&mut app);
+        assert!(screen.contains("3 PRs"), "{screen}");
+        assert!(screen.contains("state unknown"), "{screen}");
     }
 
     #[test]
@@ -766,6 +901,7 @@ mod menu_tests {
             cwd: PathBuf::from(cwd),
             started_at_ms: None,
             detail: None,
+            prs: Vec::new(),
         }
     }
 
