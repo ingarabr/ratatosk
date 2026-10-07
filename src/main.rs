@@ -3,9 +3,11 @@ mod app;
 mod config;
 mod git;
 mod launch;
+mod names;
 mod picker;
 mod place;
 mod recent;
+mod state;
 mod ui;
 
 use std::{io::stdout, path::Path, process::Command};

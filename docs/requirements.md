@@ -48,7 +48,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
 - `n:` in the prompt filters by text. `#123` filters by PR. Esc clears the prompt.
 - Actions use Ctrl.
   - These match the agents view:
-    - `^R` renames in place, inside the row.
+    - `^R` renames in place, inside the row. Claude Code has no command to rename a background session from outside (only Ctrl+R in the agents view and `/rename` inside the session), so Ratatosk keeps its own names in `~/.local/state/ratatosk/names.json`. The agents view and `claude --resume <name>` keep Claude's name, and the details band shows it beside Ratatosk's. Saving an empty name goes back to Claude's.
     - `^X` stops; a second `^X` within two seconds deletes.
     - `^S` switches grouping.
     - `^F` finds.

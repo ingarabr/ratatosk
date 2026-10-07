@@ -6,12 +6,7 @@ use std::{
 const KEEP: usize = 20;
 
 pub fn path() -> Option<PathBuf> {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
-    Some(state.join("ratatosk/recent"))
+    crate::state::dir().map(|dir| dir.join("recent"))
 }
 
 pub fn load(path: &Path) -> Vec<String> {

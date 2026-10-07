@@ -85,11 +85,15 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Scope {
+    #[default]
     All,
     Org(String),
-    Repo { org: String, repo: String },
+    Repo {
+        org: String,
+        repo: String,
+    },
     Outside,
 }
 

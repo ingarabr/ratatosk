@@ -14,6 +14,7 @@ use crate::{
     config::ManualModel,
     git,
     launch::{self, Draft, Field, Launch, Repo, Target},
+    names,
     place::{Place, Scope},
     recent,
 };
@@ -21,8 +22,9 @@ use crate::{
 const RECENT_SHOWN: usize = 6;
 const DELETE_WINDOW: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
+    #[default]
     List,
     Menu,
 }
@@ -41,6 +43,7 @@ pub enum Action {
     Delete { id: String },
 }
 
+#[derive(Default)]
 pub struct App {
     pub base: PathBuf,
     pub sessions: Vec<Session>,
@@ -59,6 +62,10 @@ pub struct App {
     pub scopes: Vec<Scope>,
     pub scope: Scope,
     pub manual_model: ManualModel,
+    pub names_path: Option<PathBuf>,
+    pub names: HashMap<String, String>,
+    pub claude_names: HashMap<String, String>,
+    pub renaming: Option<(String, String)>,
 }
 
 impl App {
@@ -81,6 +88,10 @@ impl App {
             scopes: vec![Scope::All],
             scope: Scope::All,
             manual_model,
+            names: names::path().map(|p| names::load(&p)).unwrap_or_default(),
+            names_path: names::path(),
+            claude_names: HashMap::new(),
+            renaming: None,
         };
         app.refresh();
         app
@@ -89,7 +100,14 @@ impl App {
     pub fn refresh(&mut self) {
         let keep = self.selected_session().map(|s| s.id.clone());
         match agents::load() {
-            Ok(sessions) => {
+            Ok(mut sessions) => {
+                self.claude_names.clear();
+                for session in &mut sessions {
+                    if let Some(name) = self.names.get(&session.id) {
+                        let claude = std::mem::replace(&mut session.name, name.clone());
+                        self.claude_names.insert(session.id.clone(), claude);
+                    }
+                }
                 self.sessions = sessions;
                 self.error = None;
             }
@@ -117,6 +135,10 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         self.status = None;
+        if self.renaming.is_some() {
+            self.on_rename_key(key);
+            return Action::None;
+        }
         if self.draft.is_some() {
             return self.on_draft_key(key);
         }
@@ -136,6 +158,11 @@ impl App {
             KeyCode::Left if self.input.is_empty() => self.focus = Focus::Menu,
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
+            KeyCode::Char('r') if ctrl => {
+                if let Some(s) = self.selected_session() {
+                    self.renaming = Some((s.id.clone(), s.name.clone()));
+                }
+            }
             KeyCode::Esc if self.input.is_empty() => return Action::Quit,
             KeyCode::Esc => self.input.clear(),
             KeyCode::Enter if !self.input.trim().is_empty() => {
@@ -246,6 +273,50 @@ impl App {
         }
         recent.truncate(RECENT_SHOWN);
         recent
+    }
+
+    fn on_rename_key(&mut self, key: KeyEvent) {
+        let Some((id, buffer)) = self.renaming.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.renaming = None,
+            KeyCode::Enter => {
+                let (id, name) = (id.clone(), buffer.trim().to_string());
+                self.renaming = None;
+                self.rename(&id, &name);
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => buffer.clear(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => buffer.push(c),
+            _ => {}
+        }
+    }
+
+    fn rename(&mut self, id: &str, name: &str) {
+        let Some(i) = self.sessions.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let claude = self
+            .claude_names
+            .remove(id)
+            .unwrap_or_else(|| self.sessions[i].name.clone());
+        if name.is_empty() || name == claude {
+            self.names.remove(id);
+            self.sessions[i].name = claude;
+        } else {
+            self.names.insert(id.to_string(), name.to_string());
+            self.claude_names.insert(id.to_string(), claude);
+            self.sessions[i].name = name.to_string();
+        }
+        if let Some(path) = &self.names_path
+            && let Err(err) = names::save(path, &self.names)
+        {
+            self.error = Some(format!("could not save names: {err}"));
+        }
+        self.layout(Some(id));
     }
 
     pub fn stop_or_delete(&mut self, now: Instant) -> Action {
@@ -445,6 +516,7 @@ mod tests {
             scopes: vec![Scope::All],
             scope: Scope::All,
             manual_model: ManualModel::default(),
+            ..Default::default()
         }
     }
 
@@ -504,6 +576,7 @@ mod scope_tests {
             focus: Focus::List,
             scopes: vec![Scope::All],
             scope: Scope::All,
+            ..Default::default()
         };
         for (id, cwd) in [
             ("a", "/p/acme/billing"),
@@ -535,5 +608,72 @@ mod scope_tests {
         assert_eq!(shown, ["a"]);
         app.on_key(KeyEvent::from(KeyCode::Right));
         assert_eq!(app.focus, Focus::List);
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use ratatui::crossterm::event::KeyEvent;
+
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        app.sessions.push(Session {
+            id: "a1".into(),
+            name: "billing: credit-note".into(),
+            state: State::Done,
+            cwd: PathBuf::from("/elsewhere"),
+            started_at_ms: None,
+            detail: None,
+        });
+        app.rebuild(None);
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn ctrl_r_edits_the_name_in_place_and_enter_keeps_it() {
+        let mut app = app();
+        ctrl(&mut app, 'r');
+        ctrl(&mut app, 'u');
+        type_text(&mut app, "credit notes");
+        assert!(app.input.is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sessions[0].name, "credit notes");
+        assert_eq!(app.names["a1"], "credit notes");
+        assert_eq!(app.claude_names["a1"], "billing: credit-note");
+    }
+
+    #[test]
+    fn esc_cancels_and_an_empty_name_restores_claudes() {
+        let mut app = app();
+        ctrl(&mut app, 'r');
+        type_text(&mut app, " x");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.sessions[0].name, "billing: credit-note");
+
+        app.rename("a1", "credit notes");
+        ctrl(&mut app, 'r');
+        ctrl(&mut app, 'u');
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sessions[0].name, "billing: credit-note");
+        assert!(app.names.is_empty());
     }
 }

@@ -129,7 +129,15 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
                     Span::raw("  "),
                     Span::styled(session.state.glyph(), state_style(session.state)),
                     Span::raw(" "),
-                    Span::raw(session.name.as_str()),
+                    match &app.renaming {
+                        Some((id, buffer)) if *id == session.id => Span::styled(
+                            format!("{buffer}▏"),
+                            Style::new()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::UNDERLINED),
+                        ),
+                        _ => Span::raw(session.name.as_str()),
+                    },
                 ])),
                 Cell::from(if app.places[*i].worktree().is_some() {
                     WORKTREE
@@ -177,6 +185,13 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .title(TextLine::from(vec![
             Span::raw(format!(" {} ", session.name)).bold(),
+            Span::raw(
+                app.claude_names
+                    .get(&session.id)
+                    .map(|claude| format!("(Claude: {claude}) "))
+                    .unwrap_or_default(),
+            )
+            .dim(),
             Span::styled(
                 format!("{} ", state_word(session.state)),
                 state_style(session.state),
@@ -349,7 +364,12 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(message(status, Style::new().fg(Color::Yellow)), area);
         return;
     }
-    let hints: [&str; 2] = if app.focus == Focus::Menu {
+    let hints: [&str; 2] = if app.renaming.is_some() {
+        [
+            "type the new name · enter to save · esc to cancel",
+            "an empty name goes back to Claude's own name",
+        ]
+    } else if app.focus == Focus::Menu {
         [
             "↑↓ to pick a project · the list follows",
             "→ or enter to go back to the list",
@@ -357,7 +377,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_empty() {
         [
             "↑↓ to select · enter to attach · ← for projects · ctrl+z in a session to come back",
-            "ctrl+x to stop, twice to delete · type to start a session · esc to quit",
+            "ctrl+r to rename · ctrl+x to stop, twice to delete · type to start a session · esc to quit",
         ]
     } else {
         ["enter to review and start", "esc to clear"]
@@ -624,6 +644,7 @@ mod tests {
             scopes: vec![Scope::All],
             scope: Scope::All,
             manual_model: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -776,6 +797,7 @@ mod menu_tests {
             manual_model: Default::default(),
             focus: Focus::Menu,
             scope: Scope::Org("acme".into()),
+            ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
