@@ -1,7 +1,11 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    num::NonZeroU16,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ratatui::{
     Frame,
+    buffer::{Buffer, CellDiffOption},
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line as TextLine, Span},
@@ -29,21 +33,10 @@ const PR_MERGED: &str = "\u{f419}";
 const PR_CLOSED: &str = "\u{f4dc}";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let details_height = match (
-        frame.area().height >= DETAILS_FROM_HEIGHT,
-        app.selected_session_index(),
-    ) {
-        (true, Some(i)) => {
-            let detail = if app.sessions[i].detail.is_some() {
-                2
-            } else {
-                0
-            };
-            let pr = u16::from(!app.prs_for(i).is_empty());
-            4 + pr + detail
-        }
-        (true, None) => 3,
-        (false, _) => 0,
+    let details_height = if frame.area().height >= DETAILS_FROM_HEIGHT {
+        DETAILS_HEIGHT
+    } else {
+        0
     };
     let [details, body, prompt, hints] = Layout::vertical([
         Constraint::Length(details_height),
@@ -188,9 +181,26 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
     .highlight_symbol("❯ ")
     .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(table, area, &mut state);
+    let offset = state.offset();
     app.table = state;
+    let rows = area.height.saturating_sub(2) as usize;
+    for (n, line) in app.lines.iter().enumerate().skip(offset).take(rows) {
+        if let Line::Session(i) = line
+            && let [pr] = app.prs_for(*i).as_slice()
+        {
+            link(
+                frame.buffer_mut(),
+                area,
+                area.y + 1 + (n - offset) as u16,
+                &pr_text(pr),
+                &pr.url,
+            );
+        }
+    }
 }
 
+// Border, location, folder, PRs and two status lines; fixed so the list doesn't jump.
+const DETAILS_HEIGHT: u16 = 7;
 const DETAILS_FROM_HEIGHT: u16 = 20;
 const LABEL: usize = 9;
 
@@ -281,6 +291,8 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
         lines.push(TextLine::from(spans));
+    } else {
+        lines.push(TextLine::default());
     }
     if let Some(detail) = &session.detail {
         let width = (inner.width as usize).saturating_sub(LABEL);
@@ -299,6 +311,37 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    for pr in &prs {
+        link(frame.buffer_mut(), area, inner.y + 2, &pr_text(pr), &pr.url);
+    }
+}
+
+// Ratatui has no hyperlinks: the OSC 8 sequence and its text go into the first cell, forced to
+// the text's width so the renderer skips the cells it covers. Ghostty opens it on Cmd+click.
+fn link(buf: &mut Buffer, area: Rect, y: u16, text: &str, url: &str) {
+    if url.is_empty() || y < area.top() || y >= area.bottom() {
+        return;
+    }
+    let wanted: Vec<String> = text.chars().map(String::from).collect();
+    let Some(width) = NonZeroU16::new(wanted.len() as u16) else {
+        return;
+    };
+    let xs: Vec<u16> = (area.left()..area.right()).collect();
+    let Some(start) = xs
+        .windows(wanted.len())
+        .find(|cells| {
+            cells
+                .iter()
+                .zip(&wanted)
+                .all(|(&x, w)| buf[(x, y)].symbol() == w)
+        })
+        .map(|cells| cells[0])
+    else {
+        return;
+    };
+    buf[(start, y)]
+        .set_symbol(&format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"))
+        .set_diff_option(CellDiffOption::ForcedWidth(width));
 }
 
 fn wrap_clipped(text: &str, width: usize, max_lines: usize) -> Vec<String> {
@@ -634,14 +677,18 @@ fn prs_badge(prs: &[Pr]) -> TextLine<'static> {
     }
 }
 
-fn pr_badge(pr: &Pr) -> TextLine<'static> {
+fn pr_text(pr: &Pr) -> String {
     let icon = match pr.state {
         PrState::Open | PrState::Unknown => PR_OPEN,
         PrState::Draft => PR_DRAFT,
         PrState::Merged => PR_MERGED,
         PrState::Closed => PR_CLOSED,
     };
-    TextLine::from(format!("{icon} {}", pr.number)).style(pr_style(pr.state))
+    format!("{icon} {}", pr.number)
+}
+
+fn pr_badge(pr: &Pr) -> TextLine<'static> {
+    TextLine::from(pr_text(pr)).style(pr_style(pr.state))
 }
 
 fn pr_style(state: PrState) -> Style {
@@ -785,6 +832,7 @@ mod tests {
                         number: 2085,
                         state: PrState::Open,
                         title: "Track payouts".into(),
+                        url: "https://github.com/acme/billing/pull/2085".into(),
                     },
                 )]
                 .into(),
@@ -793,6 +841,12 @@ mod tests {
         let screen = screen(&mut app);
         assert!(screen.contains(&format!("{PR_OPEN} 2085")), "{screen}");
         assert!(screen.contains("open · Track payouts"), "{screen}");
+        let link = "\x1b]8;;https://github.com/acme/billing/pull/2085\x1b\\";
+        assert_eq!(
+            screen.matches(link).count(),
+            2,
+            "list and details both link the PR"
+        );
     }
 
     #[test]

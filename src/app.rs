@@ -352,6 +352,7 @@ impl App {
                     number: r.number,
                     state: PrState::Unknown,
                     title: String::new(),
+                    url: format!("https://github.com/{}/pull/{}", r.repo, r.number),
                 })
             })
             .collect();
@@ -817,6 +818,7 @@ mod pr_tests {
                 number: 11,
                 state: PrState::Merged,
                 title: "Refunds".into(),
+                url: String::new(),
             },
         );
         repo.by_number.insert(
@@ -825,6 +827,7 @@ mod pr_tests {
                 number: 12,
                 state: PrState::Open,
                 title: "Payouts".into(),
+                url: String::new(),
             },
         );
         app.dir_repos

@@ -23,6 +23,7 @@ pub struct Pr {
     pub number: u64,
     pub state: PrState,
     pub title: String,
+    pub url: String,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +68,7 @@ impl RepoPrs {
                 number: pr.number,
                 state,
                 title: pr.title,
+                url: pr.url,
             },
         );
     }
