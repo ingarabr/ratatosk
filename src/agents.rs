@@ -38,6 +38,7 @@ pub struct Session {
     pub state: State,
     pub cwd: PathBuf,
     pub started_at_ms: Option<u64>,
+    pub active_at_ms: Option<u64>,
     pub detail: Option<String>,
     pub prs: Vec<PrRef>,
 }
@@ -123,14 +124,21 @@ pub fn load() -> Result<Vec<Session>> {
                 id: row.id,
                 state: State::parse(row.state.as_deref()),
                 started_at_ms: row.started_at,
+                active_at_ms: job
+                    .as_ref()
+                    .and_then(|j| j.updated_at.as_deref())
+                    .and_then(iso_ms)
+                    .or(row.started_at),
             }
         })
         .collect())
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct JobState {
     detail: Option<String>,
+    updated_at: Option<String>,
     #[serde(default)]
     children: Vec<JobChild>,
 }
@@ -154,6 +162,24 @@ fn job_state(id: &str) -> Option<JobState> {
     )
     .ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+// Milliseconds since the epoch for a UTC timestamp like "2026-10-07T12:46:46.011Z".
+fn iso_ms(text: &str) -> Option<u64> {
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, "0"));
+    let mut t = clock.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, min, sec) = (t.next()??, t.next()??, t.next()??);
+    let millis: i64 = format!("{fraction:0<3}")[..3].parse().ok()?;
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(((days * 24 + h) * 60 + min) * 60_000 + sec * 1000 + millis).ok()
 }
 
 pub fn stop(id: &str) -> Result<String> {
@@ -199,6 +225,14 @@ fn live_cwds() -> HashMap<String, PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_timestamps_convert_to_epoch_millis() {
+        assert_eq!(iso_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(iso_ms("2026-10-07T12:46:46.011Z"), Some(1_791_377_206_011));
+        assert_eq!(iso_ms("2024-02-29T23:59:59Z"), Some(1_709_251_199_000));
+        assert_eq!(iso_ms("not a date"), None);
+    }
 
     #[test]
     fn pr_links_are_read_from_github_pull_urls() {

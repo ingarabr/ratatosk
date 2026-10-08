@@ -138,7 +138,7 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
             let (indent, label, style) = match scope {
                 Scope::All => ("", tilde(&app.base.to_string_lossy()), Style::new()),
                 Scope::Org(org) => (
-                    if app.collapsed.orgs.contains(org) {
+                    if app.view.collapsed_orgs.contains(org) {
                         "▸ "
                     } else {
                         "▾ "
@@ -180,14 +180,15 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
         Span::raw(" · ").dim(),
         Span::styled(
-            format!("{} working ", view.count(State::Working)),
+            format!("{} working", view.count(State::Working)),
             state_style(State::Working),
         ),
+        Span::raw(format!(" · by {} ", view.view.sort.label())).dim(),
     ]);
 
     let rows = view.lines.iter().map(|line| match line {
         Line::Header(group) => {
-            let collapsed = view.collapsed.groups.contains(group);
+            let collapsed = view.view.collapsed_groups.contains(group);
             Row::new(vec![Cell::from(TextLine::from(vec![
                 Span::styled(
                     format!("{} {group}", if collapsed { "▸" } else { "▾" }),
@@ -225,7 +226,7 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
                 })
                 .fg(Color::Cyan),
                 Cell::from(prs_badge(&view.prs_for(*i))),
-                Cell::from(age(session.started_at_ms)).dim(),
+                Cell::from(age(session.active_at_ms)).style(recency_style(session.active_at_ms)),
             ])
         }
     });
@@ -296,9 +297,9 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]))
         .title(
-            TextLine::from(match age(session.started_at_ms) {
+            TextLine::from(match age(session.active_at_ms) {
                 age if age.is_empty() => format!(" {} ", session.id),
-                age => format!(" started {age} ago · {} ", session.id),
+                age => format!(" active {age} ago · {} ", session.id),
             })
             .dim()
             .right_aligned(),
@@ -527,7 +528,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_empty() {
         [
             "↑↓ to select · enter or → to attach · ←/→ on a group collapses/expands · tab for projects",
-            "ctrl+o to open · ctrl+r to rename · ctrl+x to stop, twice to delete · type to start a session · esc to quit",
+            "ctrl+o to open · ctrl+r to rename · ctrl+s to sort · ctrl+x to stop, twice to delete · esc to quit",
         ]
     } else {
         ["enter to review and start", "esc to clear"]
@@ -790,18 +791,42 @@ fn state_style(state: State) -> Style {
     }
 }
 
-fn age(started_at_ms: Option<u64>) -> String {
-    let Some(started) = started_at_ms else {
-        return String::new();
-    };
+fn minutes_since(at_ms: Option<u64>) -> Option<u64> {
+    let at = at_ms?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(started, |d| d.as_millis() as u64);
-    let minutes = now.saturating_sub(started) / 60_000;
-    match minutes {
-        m if m < 60 => format!("{m}m"),
-        m if m < 60 * 24 => format!("{}h", m / 60),
-        m => format!("{}d", m / (60 * 24)),
+        .map_or(at, |d| d.as_millis() as u64);
+    Some(now.saturating_sub(at) / 60_000)
+}
+
+fn age(at_ms: Option<u64>) -> String {
+    match minutes_since(at_ms) {
+        None => String::new(),
+        Some(m) if m < 60 => format!("{m}m"),
+        Some(m) if m < 60 * 24 => format!("{}h", m / 60),
+        Some(m) => format!("{}d", m / (60 * 24)),
+    }
+}
+
+const FADE_MINUTES: f64 = 7.0 * 24.0 * 60.0;
+
+// Bright for recent activity, fading on a log scale to grey over a week; older is dim.
+fn recency_style(at_ms: Option<u64>) -> Style {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let Some(minutes) = minutes_since(at_ms) else {
+        return dim;
+    };
+    if minutes as f64 >= FADE_MINUTES {
+        return dim;
+    }
+    let t = ((1.0 + minutes as f64).ln() / (1.0 + FADE_MINUTES).ln()).clamp(0.0, 1.0);
+    let mix =
+        |from: u8, to: u8| (f64::from(from) + (f64::from(to) - f64::from(from)) * t).round() as u8;
+    let style = Style::new().fg(Color::Rgb(mix(120, 110), mix(220, 118), mix(255, 128)));
+    if minutes < 60 {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
     }
 }
 
@@ -823,6 +848,7 @@ mod tests {
                 state: State::Done,
                 cwd: PathBuf::from("/p/acme/billing/.claude/worktrees/credit-note-api"),
                 started_at_ms: None,
+                active_at_ms: None,
                 detail: Some("awaiting go-ahead to push".into()),
                 prs: Vec::new(),
             }],
@@ -943,6 +969,30 @@ mod tests {
     }
 
     #[test]
+    fn recent_activity_is_bright_and_old_activity_dim() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let minutes_ago = |m: u64| Some(now - m * 60_000);
+        let fresh = recency_style(minutes_ago(5));
+        assert!(fresh.add_modifier.contains(Modifier::BOLD));
+        let Some(Color::Rgb(r1, ..)) = recency_style(minutes_ago(60 * 3)).fg else {
+            panic!("hours get a colour")
+        };
+        let Some(Color::Rgb(r2, ..)) = recency_style(minutes_ago(60 * 24 * 5)).fg else {
+            panic!("days get a colour")
+        };
+        assert_ne!(r1, r2, "the colour changes with age");
+        assert!(
+            recency_style(minutes_ago(60 * 24 * 8))
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(recency_style(None).add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
     fn long_status_is_cut_to_two_lines() {
         let lines = wrap_clipped(&"word ".repeat(40), 30, 2);
         assert_eq!(lines.len(), 2);
@@ -1025,6 +1075,7 @@ mod menu_tests {
             state: State::Done,
             cwd: PathBuf::from(cwd),
             started_at_ms: None,
+            active_at_ms: None,
             detail: None,
             prs: Vec::new(),
         }

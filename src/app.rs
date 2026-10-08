@@ -20,7 +20,7 @@ use crate::{
     place::{Place, Scope},
     pr::{self, Pr, PrState, RepoPrs},
     recent,
-    state::Collapsed,
+    state::{Sort, ViewState},
 };
 
 const RECENT_SHOWN: usize = 6;
@@ -76,8 +76,8 @@ pub struct App {
     pub dir_repos: HashMap<PathBuf, String>,
     pub pr_lookup: Option<Receiver<pr::Found>>,
     pub prs_requested: Option<Instant>,
-    pub collapsed: Collapsed,
-    pub collapsed_path: Option<PathBuf>,
+    pub view: ViewState,
+    pub view_path: Option<PathBuf>,
     pub openers: Vec<Opener>,
     pub fitting: Vec<Vec<usize>>,
     pub choosing: Option<Choice>,
@@ -117,10 +117,10 @@ impl App {
             dir_repos: HashMap::new(),
             pr_lookup: None,
             prs_requested: None,
-            collapsed: Collapsed::path()
-                .map(|p| Collapsed::load(&p))
+            view: ViewState::path()
+                .map(|p| ViewState::load(&p))
                 .unwrap_or_default(),
-            collapsed_path: Collapsed::path(),
+            view_path: ViewState::path(),
             openers,
             fitting: Vec::new(),
             choosing: None,
@@ -209,6 +209,12 @@ impl App {
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
             KeyCode::Char('o') if ctrl => return self.open_selected(),
+            KeyCode::Char('s') if ctrl => {
+                self.view.sort = self.view.sort.next();
+                self.save_view();
+                let keep = self.selected_session().map(|s| s.id.clone());
+                self.layout(keep.as_deref());
+            }
             KeyCode::Char('r') if ctrl => {
                 if let Some(s) = self.selected_session() {
                     self.renaming = Some((s.id.clone(), s.name.clone()));
@@ -553,12 +559,19 @@ impl App {
         let mut order: Vec<usize> = (0..self.sessions.len())
             .filter(|&i| self.scope.matches(&places[i]))
             .collect();
+        let sort = self.view.sort;
         order.sort_by_key(|&i| {
             let place = &places[i];
+            let session = &self.sessions[i];
+            let recency = match sort {
+                Sort::Active => std::cmp::Reverse(session.active_at_ms.unwrap_or(0)),
+                Sort::Name => std::cmp::Reverse(0),
+            };
             (
                 matches!(place, Place::Outside),
                 place.group(),
-                self.sessions[i].name.to_lowercase(),
+                recency,
+                session.name.to_lowercase(),
             )
         });
 
@@ -570,7 +583,7 @@ impl App {
                 lines.push(Line::Header(group.clone()));
                 current = Some(group.clone());
             }
-            if !self.collapsed.groups.contains(&group) {
+            if !self.view.collapsed_groups.contains(&group) {
                 lines.push(Line::Session(i));
             }
         }
@@ -606,10 +619,10 @@ impl App {
         let Some(group) = self.selected_group() else {
             return;
         };
-        if !self.collapsed.groups.remove(&group) {
-            self.collapsed.groups.insert(group.clone());
+        if !self.view.collapsed_groups.remove(&group) {
+            self.view.collapsed_groups.insert(group.clone());
         }
-        self.save_collapsed();
+        self.save_view();
         self.layout(None);
         self.table.select(self.header_line(&group));
     }
@@ -694,7 +707,7 @@ impl App {
 
     fn list_left(&mut self) {
         match self.lines.get(self.table.selected().unwrap_or(usize::MAX)) {
-            Some(Line::Header(group)) if !self.collapsed.groups.contains(group) => {
+            Some(Line::Header(group)) if !self.view.collapsed_groups.contains(group) => {
                 self.toggle_group()
             }
             _ => self.focus = Focus::Menu,
@@ -706,7 +719,7 @@ impl App {
             return Action::None;
         };
         match self.lines.get(at) {
-            Some(Line::Header(group)) if self.collapsed.groups.contains(group) => {
+            Some(Line::Header(group)) if self.view.collapsed_groups.contains(group) => {
                 self.toggle_group()
             }
             Some(Line::Header(_)) => {
@@ -722,9 +735,9 @@ impl App {
 
     fn menu_left(&mut self) {
         match self.scope.clone() {
-            Scope::Org(org) if !self.collapsed.orgs.contains(&org) => {
-                self.collapsed.orgs.insert(org);
-                self.save_collapsed();
+            Scope::Org(org) if !self.view.collapsed_orgs.contains(&org) => {
+                self.view.collapsed_orgs.insert(org);
+                self.save_view();
             }
             Scope::Repo { org, .. } => {
                 self.scope = Scope::Org(org);
@@ -737,26 +750,26 @@ impl App {
 
     fn menu_right(&mut self) {
         match self.scope.clone() {
-            Scope::Org(org) if self.collapsed.orgs.contains(&org) => {
-                self.collapsed.orgs.remove(&org);
-                self.save_collapsed();
+            Scope::Org(org) if self.view.collapsed_orgs.contains(&org) => {
+                self.view.collapsed_orgs.remove(&org);
+                self.save_view();
             }
             _ => self.focus = Focus::List,
         }
     }
 
-    fn save_collapsed(&mut self) {
-        if let Some(path) = &self.collapsed_path
-            && let Err(err) = self.collapsed.save(path)
+    fn save_view(&mut self) {
+        if let Some(path) = &self.view_path
+            && let Err(err) = self.view.save(path)
         {
-            self.error = Some(format!("could not save collapsed groups: {err}"));
+            self.error = Some(format!("could not save the view settings: {err}"));
         }
     }
 
     pub fn visible_scopes(&self) -> Vec<&Scope> {
         self.scopes
             .iter()
-            .filter(|scope| !matches!(scope, Scope::Repo { org, .. } if self.collapsed.orgs.contains(org)))
+            .filter(|scope| !matches!(scope, Scope::Repo { org, .. } if self.view.collapsed_orgs.contains(org)))
             .collect()
     }
 
@@ -825,6 +838,7 @@ mod tests {
                 state: State::Done,
                 cwd: PathBuf::from("/elsewhere"),
                 started_at_ms: None,
+                active_at_ms: None,
                 detail: None,
                 prs: Vec::new(),
             })
@@ -920,6 +934,7 @@ mod scope_tests {
                 state: State::Done,
                 cwd: PathBuf::from(cwd),
                 started_at_ms: None,
+                active_at_ms: None,
                 detail: None,
                 prs: Vec::new(),
             });
@@ -960,6 +975,7 @@ mod rename_tests {
             state: State::Done,
             cwd: PathBuf::from("/elsewhere"),
             started_at_ms: None,
+            active_at_ms: None,
             detail: None,
             prs: Vec::new(),
         });
@@ -1027,6 +1043,7 @@ mod pr_tests {
             state: State::Done,
             cwd: PathBuf::from("/p/acme/billing/.claude/worktrees/refunds"),
             started_at_ms: None,
+            active_at_ms: None,
             detail: None,
             prs: Vec::new(),
         });
@@ -1120,6 +1137,7 @@ mod draft_scope_tests {
             state: State::Done,
             cwd: PathBuf::from("/p/globex/engine"),
             started_at_ms: None,
+            active_at_ms: None,
             detail: None,
             prs: Vec::new(),
         });
@@ -1178,6 +1196,7 @@ mod collapse_tests {
                 state: State::Done,
                 cwd: PathBuf::from(cwd),
                 started_at_ms: None,
+                active_at_ms: None,
                 detail: None,
                 prs: Vec::new(),
             });
@@ -1299,11 +1318,11 @@ mod collapse_tests {
         let path = std::env::temp_dir()
             .join(format!("ratatosk-collapsed-{}", std::process::id()))
             .join("c.json");
-        let mut collapsed = Collapsed::default();
-        collapsed.groups.insert("acme / billing".into());
-        collapsed.orgs.insert("globex".into());
+        let mut collapsed = ViewState::default();
+        collapsed.collapsed_groups.insert("acme / billing".into());
+        collapsed.collapsed_orgs.insert("globex".into());
         collapsed.save(&path).unwrap();
-        assert_eq!(Collapsed::load(&path), collapsed);
+        assert_eq!(ViewState::load(&path), collapsed);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
@@ -1333,6 +1352,7 @@ mod open_tests {
             state: State::Done,
             cwd: PathBuf::from("/p/acme/billing/.claude/worktrees/refunds/src"),
             started_at_ms: None,
+            active_at_ms: None,
             detail: None,
             prs: Vec::new(),
         });
@@ -1378,5 +1398,54 @@ mod open_tests {
         let mut app = app(Vec::new());
         assert!(matches!(ctrl_o(&mut app), Action::None));
         assert!(app.status.as_deref().unwrap_or("").contains("openers"));
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use ratatui::crossterm::event::KeyEvent;
+
+    use super::*;
+
+    #[test]
+    fn ctrl_s_sorts_by_last_activity_within_each_group() {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        for (id, cwd, active) in [
+            ("alpha", "/p/acme/billing", 1),
+            ("beta", "/p/acme/billing", 3),
+            ("gamma", "/p/globex/engine", 2),
+        ] {
+            app.sessions.push(Session {
+                id: id.into(),
+                name: id.into(),
+                state: State::Done,
+                cwd: PathBuf::from(cwd),
+                started_at_ms: None,
+                active_at_ms: Some(active),
+                detail: None,
+                prs: Vec::new(),
+            });
+        }
+        app.rebuild(None);
+        let order = |app: &App| -> Vec<String> {
+            app.lines
+                .iter()
+                .filter_map(|l| match l {
+                    Line::Session(i) => Some(app.sessions[*i].id.clone()),
+                    Line::Header(_) => None,
+                })
+                .collect()
+        };
+        assert_eq!(order(&app), ["alpha", "beta", "gamma"]);
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.view.sort, Sort::Active);
+        assert_eq!(
+            order(&app),
+            ["beta", "alpha", "gamma"],
+            "newest first, groups kept"
+        );
     }
 }
