@@ -41,6 +41,9 @@ pub struct Session {
     pub active_at_ms: Option<u64>,
     pub detail: Option<String>,
     pub prs: Vec<PrRef>,
+    // A plain `claude` in a terminal of its own: listed, but `claude attach`, `stop` and `rm`
+    // only work on background sessions.
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +69,9 @@ impl PrRef {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentRow {
-    id: String,
+    id: Option<String>,
+    kind: Option<String>,
+    status: Option<String>,
     cwd: PathBuf,
     name: Option<String>,
     state: Option<String>,
@@ -91,22 +96,36 @@ pub fn load() -> Result<Vec<Session>> {
         "`claude agents --json` failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    let rows: Vec<AgentRow> = serde_json::from_slice(&out.stdout)
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
         .context("unexpected output from `claude agents --json`")?;
+    let rows = values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<AgentRow>(value).ok());
     // `claude agents` reports where a session started; its session file has where it is now (e.g. after EnterWorktree).
     let live = live_cwds();
     Ok(rows
-        .into_iter()
-        .map(|row| {
-            let job = job_state(&row.id);
-            Session {
+        .filter_map(|row| {
+            let id = row.id.clone().or_else(|| {
+                row.session_id
+                    .as_deref()
+                    .map(|s| s.chars().take(8).collect())
+            })?;
+            let job = job_state(&id);
+            let state = match (row.state.as_deref(), row.status.as_deref()) {
+                (Some(state), _) => State::parse(Some(state)),
+                (None, Some("busy")) => State::Working,
+                (None, Some(_)) => State::Done,
+                (None, None) => State::Unknown,
+            };
+            Some(Session {
                 cwd: row
                     .session_id
                     .as_deref()
                     .and_then(|id| live.get(id))
                     .cloned()
                     .unwrap_or(row.cwd),
-                name: row.name.unwrap_or_else(|| row.id.clone()),
+                name: row.name.unwrap_or_else(|| id.clone()),
+                interactive: row.kind.as_deref() == Some("interactive"),
                 detail: job
                     .as_ref()
                     .and_then(|j| j.detail.clone())
@@ -121,15 +140,15 @@ pub fn load() -> Result<Vec<Session>> {
                             .collect()
                     })
                     .unwrap_or_default(),
-                id: row.id,
-                state: State::parse(row.state.as_deref()),
+                id,
+                state,
                 started_at_ms: row.started_at,
                 active_at_ms: job
                     .as_ref()
                     .and_then(|j| j.updated_at.as_deref())
                     .and_then(iso_ms)
                     .or(row.started_at),
-            }
+            })
         })
         .collect())
 }

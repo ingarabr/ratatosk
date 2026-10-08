@@ -89,7 +89,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   - "all projects" as a tree of orgs, collapsed by default. → opens an org, ← closes it, Enter picks a repo.
 - Typing filters across all repos. The list also offers `+ new folder <org>/<name>`, and `org/name` narrows that to one org. Ratatosk creates the folder only when the session actually starts.
 - Tab and Shift+Tab move between project, model and effort.
-- Claude Code starts a background session only in a folder whose trust prompt was accepted for that exact folder (a trusted parent doesn't count), and Ratatosk never accepts it on the user's behalf. It checks the flag in `~/.claude.json` before starting, and when the folder isn't trusted (or `claude --bg` refuses), the confirmation says so: Enter then opens an interactive `claude` there to answer the prompt, and once the user types `/exit` Ratatosk starts the session.
+- Claude Code starts a background session only in a folder whose trust prompt was accepted for that exact folder (a trusted parent doesn't count), and Ratatosk never accepts it on the user's behalf. It checks the flag in `~/.claude.json` before starting, and when the folder isn't trusted (or `claude --bg` refuses), the confirmation says so: Enter then opens an interactive `claude` there to answer the prompt; Ratatosk closes it as soon as the folder is trusted and starts the session.
 - The prompt line wraps and grows up to eight lines. Shift+Enter, Alt+Enter or Ctrl+J insert a newline. The confirmation shows the prompt, the command and any message wrapped in full.
 - Model routing:
   - The config's `manualModel` section lists orgs and prompt words. A prompt or project that matches one is never sent to a model router, and model and effort have to be picked by hand.
@@ -128,7 +128,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
 
 ## Data sources
 
-- `claude agents --json --all` is the supported interface and the ground truth. Without `--all` it leaves out completed sessions, which the agents view still lists in its "Completed" group. In 2.1.292 it has id, name, cwd, kind, state, status, pid, sessionId and startedAt. The docs mention `waitingFor`, but this build doesn't output it.
+- `claude agents --json --all` is the supported interface and the ground truth. Interactive sessions (a plain `claude` in another terminal) are listed too, without `id` or `state`; Ratatosk shows them but can't attach to, stop or delete them. Rows are parsed one by one, so an unexpected row is skipped rather than breaking the list. Without `--all` it leaves out completed sessions, which the agents view still lists in its "Completed" group. In 2.1.292 it has id, name, cwd, kind, state, status, pid, sessionId and startedAt. The docs mention `waitingFor`, but this build doesn't output it.
 - `~/.claude/sessions/<pid>.json` gives the live working directory, status and name. Watch it for changes and reconcile against `claude agents --json`.
 - The docs say not to parse `~/.claude/jobs/<id>/state.json`, so use it as optional extra detail only. Its `detail` field is the one-line status the agents view shows ("awaiting go-ahead to push"), and the details pane uses it when it can be read.
 - Never talk to the daemon's `control.sock`. Its protocol is private and authenticated.

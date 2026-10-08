@@ -16,6 +16,7 @@ mod ui;
 
 use std::{
     io::stdout,
+    os::unix::process::CommandExt,
     path::Path,
     process::Command,
     time::{Duration, Instant},
@@ -157,7 +158,7 @@ fn start(
     };
     let folder = place::tilde(&launch.dir);
     let ask = format!(
-        "Claude Code doesn't trust {folder} yet. Enter opens Claude there: accept its trust prompt, type /exit, and the session starts."
+        "Claude Code doesn't trust {folder} yet. Enter opens Claude there to answer its trust prompt; once you accept, Ratatosk closes it and starts this session."
     );
     if !launch.create && trust::is_trusted(&launch.dir) == Some(false) {
         refused(app, ask);
@@ -186,54 +187,78 @@ fn start(
     Ok(())
 }
 
-// An interactive `claude`, so its trust prompt can be answered; the user leaves with /exit.
+// An interactive `claude` in the folder, only so its trust prompt can be answered: it is closed
+// as soon as the folder is trusted, and the caller then starts the real session.
 fn run_claude_in(terminal: &mut DefaultTerminal, dir: &Path) -> Result<()> {
-    restore();
-    let waited = Command::new("claude")
-        .current_dir(dir)
-        .spawn()
-        .context("could not run `claude`")
-        .and_then(|child| wait_detaching_on_stop(child.id() as libc::pid_t));
-    *terminal = init()?;
-    terminal.clear()?;
-    waited
+    let mut cmd = Command::new("claude");
+    cmd.current_dir(dir);
+    run_in_terminal(terminal, cmd, || trust::is_trusted(dir) == Some(true))
 }
 
 // Run from the session's own directory: from anywhere else Claude Code asks to trust the
 // caller's folder before it wakes the session.
 fn attach(terminal: &mut DefaultTerminal, id: &str, dir: &Path) -> Result<()> {
+    let mut cmd = Command::new("claude");
+    cmd.args(["attach", id]).current_dir(dir);
+    run_in_terminal(terminal, cmd, || false)
+}
+
+// Hands the terminal to `cmd` until it exits, is suspended, or `done` says it can go.
+//
+// Ctrl+Z in an interactive `claude` suspends the whole foreground job, which includes
+// Ratatosk, so Ratatosk ignores SIGTSTP while the child runs; the child gets the default
+// action back before exec, so its own Ctrl+Z still works.
+fn run_in_terminal(
+    terminal: &mut DefaultTerminal,
+    mut cmd: Command,
+    done: impl Fn() -> bool,
+) -> Result<()> {
     restore();
-    let waited = Command::new("claude")
-        .args(["attach", id])
-        .current_dir(dir)
+    unsafe {
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let waited = cmd
         .spawn()
-        .context("could not run `claude attach`")
-        .and_then(|child| wait_detaching_on_stop(child.id() as libc::pid_t));
+        .context("could not run `claude`")
+        .and_then(|child| wait_for(child.id() as libc::pid_t, done));
+    unsafe {
+        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+    }
     *terminal = init()?;
     terminal.clear()?;
     waited
 }
 
-// Ctrl+Z in an attached session stops the `claude attach` client, and only a shell would
-// ever resume it. Treat a stop as leaving the session: end the client, the session itself
-// keeps running in the daemon.
-fn wait_detaching_on_stop(pid: libc::pid_t) -> Result<()> {
+// A suspended child is ended rather than left stopped: only a shell would ever resume it, and
+// for `claude attach` the session itself keeps running in the daemon.
+fn wait_for(pid: libc::pid_t, done: impl Fn() -> bool) -> Result<()> {
+    let end = || unsafe {
+        libc::kill(pid, libc::SIGTERM);
+        libc::kill(pid, libc::SIGCONT);
+    };
+    let mut ending = false;
     loop {
         let mut status = 0;
-        if unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) } == -1 {
+        let got = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+        if got == -1 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(err).context("waiting for `claude attach`");
+            return Err(err).context("waiting for `claude`");
         }
-        if !libc::WIFSTOPPED(status) {
+        if got == pid && !libc::WIFSTOPPED(status) {
             return Ok(());
         }
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-            libc::kill(pid, libc::SIGCONT);
+        if (got == pid || done()) && !ending {
+            end();
+            ending = true;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -269,14 +294,14 @@ mod tests {
     use super::*;
 
     #[test]
-    #[expect(clippy::zombie_processes, reason = "wait_detaching_on_stop reaps it")]
+    #[expect(clippy::zombie_processes, reason = "wait_for reaps it")]
     fn a_child_that_stops_itself_is_ended() {
         let child = Command::new("sh")
             .args(["-c", "kill -STOP $$; sleep 30"])
             .spawn()
             .unwrap();
         let started = Instant::now();
-        wait_detaching_on_stop(child.id() as libc::pid_t).unwrap();
+        wait_for(child.id() as libc::pid_t, || false).unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

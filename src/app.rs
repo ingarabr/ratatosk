@@ -493,6 +493,9 @@ impl App {
     }
 
     pub fn stop_or_delete(&mut self, now: Instant) -> Action {
+        if self.interactive_selected() {
+            return Action::None;
+        }
         let Some(id) = self.selected_session().map(|s| s.id.clone()) else {
             return Action::None;
         };
@@ -507,7 +510,24 @@ impl App {
         Action::Stop { id }
     }
 
-    fn attach_selected(&self) -> Action {
+    fn interactive_selected(&mut self) -> bool {
+        let Some(name) = self
+            .selected_session()
+            .filter(|s| s.interactive)
+            .map(|s| s.name.clone())
+        else {
+            return false;
+        };
+        self.status = Some(format!(
+            "{name} runs in a terminal of its own; switch to that terminal to use it"
+        ));
+        true
+    }
+
+    fn attach_selected(&mut self) -> Action {
+        if self.interactive_selected() {
+            return Action::None;
+        }
         self.selected_session()
             .map_or(Action::None, |s| Action::Attach {
                 id: s.id.clone(),
@@ -863,6 +883,7 @@ mod tests {
                 active_at_ms: None,
                 detail: None,
                 prs: Vec::new(),
+                interactive: false,
             })
             .collect();
         App {
@@ -959,6 +980,7 @@ mod scope_tests {
                 active_at_ms: None,
                 detail: None,
                 prs: Vec::new(),
+                interactive: false,
             });
         }
         app.rebuild(None);
@@ -1000,6 +1022,7 @@ mod rename_tests {
             active_at_ms: None,
             detail: None,
             prs: Vec::new(),
+            interactive: false,
         });
         app.rebuild(None);
         app
@@ -1068,6 +1091,7 @@ mod pr_tests {
             active_at_ms: None,
             detail: None,
             prs: Vec::new(),
+            interactive: false,
         });
         app.places = vec![Place::of(&app.base, &app.sessions[0].cwd)];
         app.branches = vec![Some("refunds".into())];
@@ -1165,6 +1189,7 @@ mod draft_scope_tests {
             active_at_ms: None,
             detail: None,
             prs: Vec::new(),
+            interactive: false,
         });
         app.rebuild(None);
         app.scope = scope;
@@ -1224,6 +1249,7 @@ mod collapse_tests {
                 active_at_ms: None,
                 detail: None,
                 prs: Vec::new(),
+                interactive: false,
             });
         }
         app.rebuild(None);
@@ -1380,6 +1406,7 @@ mod open_tests {
             active_at_ms: None,
             detail: None,
             prs: Vec::new(),
+            interactive: false,
         });
         app.rebuild(None);
         app.fitting = vec![fitting];
@@ -1452,6 +1479,7 @@ mod sort_tests {
                 active_at_ms: Some(active),
                 detail: None,
                 prs: Vec::new(),
+                interactive: false,
             });
         }
         app.rebuild(None);
@@ -1518,6 +1546,47 @@ mod prompt_tests {
         assert!(matches!(
             app.on_key(KeyEvent::from(KeyCode::Enter)),
             Action::Trust { .. }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod interactive_tests {
+    use ratatui::crossterm::event::KeyEvent;
+
+    use super::*;
+
+    #[test]
+    fn interactive_sessions_are_listed_but_not_attached_or_stopped() {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        app.sessions.push(Session {
+            id: "4a1697c6".into(),
+            name: "ratatosk-7a".into(),
+            state: State::Done,
+            cwd: PathBuf::from("/elsewhere"),
+            started_at_ms: None,
+            active_at_ms: None,
+            detail: None,
+            prs: Vec::new(),
+            interactive: true,
+        });
+        app.rebuild(None);
+        assert!(matches!(
+            app.on_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("terminal of its own")
+        );
+        assert!(matches!(
+            app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Action::None
         ));
     }
 }

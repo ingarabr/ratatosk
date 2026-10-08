@@ -324,6 +324,12 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
                 format!("{} ", state_word(session.state)),
                 state_style(session.state),
             ),
+            Span::raw(if session.interactive {
+                "· in its own terminal "
+            } else {
+                ""
+            })
+            .dim(),
         ]))
         .title(
             TextLine::from(match age(session.active_at_ms) {
@@ -976,6 +982,7 @@ mod tests {
                 active_at_ms: None,
                 detail: Some("awaiting go-ahead to push".into()),
                 prs: Vec::new(),
+                interactive: false,
             }],
             places: vec![crate::place::repo(
                 "acme",
@@ -1236,6 +1243,7 @@ mod menu_tests {
             active_at_ms: None,
             detail: None,
             prs: Vec::new(),
+            interactive: false,
         }
     }
 
