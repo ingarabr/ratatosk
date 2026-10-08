@@ -16,6 +16,7 @@ use crate::{
     git,
     launch::{self, Draft, Field, Launch, Repo, Target},
     names,
+    open::{self, Opener},
     place::{Place, Scope},
     pr::{self, Pr, PrState, RepoPrs},
     recent,
@@ -44,6 +45,7 @@ pub enum Action {
     Attach { id: String, cwd: PathBuf },
     Start { launch: Launch, open: bool },
     Stop { id: String },
+    Open { opener: usize, dir: PathBuf },
     Delete { id: String },
 }
 
@@ -76,10 +78,19 @@ pub struct App {
     pub prs_requested: Option<Instant>,
     pub collapsed: Collapsed,
     pub collapsed_path: Option<PathBuf>,
+    pub openers: Vec<Opener>,
+    pub fitting: Vec<Vec<usize>>,
+    pub choosing: Option<Choice>,
+}
+
+pub struct Choice {
+    pub dir: PathBuf,
+    pub options: Vec<usize>,
+    pub cursor: usize,
 }
 
 impl App {
-    pub fn new(base: PathBuf, manual_model: ManualModel) -> Self {
+    pub fn new(base: PathBuf, manual_model: ManualModel, openers: Vec<Opener>) -> Self {
         let mut app = Self {
             repos: launch::discover(&base),
             base,
@@ -110,6 +121,9 @@ impl App {
                 .map(|p| Collapsed::load(&p))
                 .unwrap_or_default(),
             collapsed_path: Collapsed::path(),
+            openers,
+            fitting: Vec::new(),
+            choosing: None,
         };
         app.refresh();
         app
@@ -157,6 +171,9 @@ impl App {
             self.on_rename_key(key);
             return Action::None;
         }
+        if self.choosing.is_some() {
+            return self.on_choice_key(key);
+        }
         if self.draft.is_some() {
             return self.on_draft_key(key);
         }
@@ -191,6 +208,7 @@ impl App {
             KeyCode::Left if self.input.is_empty() => self.list_left(),
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
+            KeyCode::Char('o') if ctrl => return self.open_selected(),
             KeyCode::Char('r') if ctrl => {
                 if let Some(s) = self.selected_session() {
                     self.renaming = Some((s.id.clone(), s.name.clone()));
@@ -513,6 +531,16 @@ impl App {
                 Place::Outside => None,
             })
             .collect();
+        let mut by_root: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        self.fitting = (0..self.sessions.len())
+            .map(|i| {
+                let root = self.root_dir(i);
+                by_root
+                    .entry(root.clone())
+                    .or_insert_with(|| open::fitting(&self.openers, &root))
+                    .clone()
+            })
+            .collect();
         self.scopes = Scope::for_places(&self.places);
         if !self.scopes.contains(&self.scope) {
             self.scope = Scope::All;
@@ -584,6 +612,84 @@ impl App {
         self.save_collapsed();
         self.layout(None);
         self.table.select(self.header_line(&group));
+    }
+
+    pub fn root_dir(&self, i: usize) -> PathBuf {
+        match &self.places[i] {
+            Place::Repo {
+                org,
+                repo,
+                worktree: Some(name),
+            } => self
+                .base
+                .join(org)
+                .join(repo)
+                .join(".claude/worktrees")
+                .join(name),
+            Place::Repo {
+                org,
+                repo,
+                worktree: None,
+            } => self.base.join(org).join(repo),
+            Place::Outside => self.sessions[i].cwd.clone(),
+        }
+    }
+
+    fn open_selected(&mut self) -> Action {
+        let Some(i) = self.selected_index() else {
+            return Action::None;
+        };
+        let dir = self.root_dir(i);
+        match self.fitting.get(i).map_or(&[][..], Vec::as_slice) {
+            [] => {
+                self.status = Some(
+                    "no opener fits this folder; add one under \"openers\" in the config"
+                        .to_string(),
+                );
+                Action::None
+            }
+            [only] => Action::Open { opener: *only, dir },
+            many => {
+                self.choosing = Some(Choice {
+                    dir,
+                    options: many.to_vec(),
+                    cursor: 0,
+                });
+                Action::None
+            }
+        }
+    }
+
+    fn on_choice_key(&mut self, key: KeyEvent) -> Action {
+        let Some(choice) = self.choosing.as_mut() else {
+            return Action::None;
+        };
+        let pick = |choice: &Choice, n: usize| Action::Open {
+            opener: choice.options[n],
+            dir: choice.dir.clone(),
+        };
+        let action = match key.code {
+            KeyCode::Esc => Action::None,
+            KeyCode::Up => {
+                choice.cursor = choice.cursor.saturating_sub(1);
+                return Action::None;
+            }
+            KeyCode::Down => {
+                choice.cursor = (choice.cursor + 1).min(choice.options.len() - 1);
+                return Action::None;
+            }
+            KeyCode::Enter => pick(choice, choice.cursor),
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let n = c as usize - '1' as usize;
+                if n >= choice.options.len() {
+                    return Action::None;
+                }
+                pick(choice, n)
+            }
+            _ => return Action::None,
+        };
+        self.choosing = None;
+        action
     }
 
     fn list_left(&mut self) {
@@ -1199,5 +1305,78 @@ mod collapse_tests {
         collapsed.save(&path).unwrap();
         assert_eq!(Collapsed::load(&path), collapsed);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use ratatui::crossterm::event::KeyEvent;
+
+    use super::*;
+
+    fn app(fitting: Vec<usize>) -> App {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        app.openers = ["IntelliJ", "RustRover", "Finder"]
+            .iter()
+            .map(|name| Opener {
+                name: name.to_string(),
+                command: vec!["true".into()],
+                when: Vec::new(),
+            })
+            .collect();
+        app.sessions.push(Session {
+            id: "a".into(),
+            name: "a".into(),
+            state: State::Done,
+            cwd: PathBuf::from("/p/acme/billing/.claude/worktrees/refunds/src"),
+            started_at_ms: None,
+            detail: None,
+            prs: Vec::new(),
+        });
+        app.rebuild(None);
+        app.fitting = vec![fitting];
+        app
+    }
+
+    fn ctrl_o(app: &mut App) -> Action {
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn one_fitting_opener_opens_the_worktree_root_directly() {
+        let mut app = app(vec![1]);
+        let Action::Open { opener, dir } = ctrl_o(&mut app) else {
+            panic!("expected Open")
+        };
+        assert_eq!(opener, 1);
+        assert_eq!(
+            dir,
+            PathBuf::from("/p/acme/billing/.claude/worktrees/refunds")
+        );
+    }
+
+    #[test]
+    fn several_fitting_openers_ask_which_one() {
+        let mut app = app(vec![0, 2]);
+        assert!(matches!(ctrl_o(&mut app), Action::None));
+        assert_eq!(
+            app.choosing.as_ref().map(|c| c.options.clone()),
+            Some(vec![0, 2])
+        );
+        let Action::Open { opener, .. } = app.on_key(KeyEvent::from(KeyCode::Char('2'))) else {
+            panic!("expected Open")
+        };
+        assert_eq!(opener, 2);
+        assert!(app.choosing.is_none());
+    }
+
+    #[test]
+    fn no_fitting_opener_says_so() {
+        let mut app = app(Vec::new());
+        assert!(matches!(ctrl_o(&mut app), Action::None));
+        assert!(app.status.as_deref().unwrap_or("").contains("openers"));
     }
 }

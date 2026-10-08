@@ -6,11 +6,14 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::open::Opener;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
     pub base_dir: Option<String>,
     pub manual_model: ManualModel,
+    pub openers: Option<Vec<Opener>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -42,6 +45,10 @@ impl Config {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err).with_context(|| format!("could not read {}", path.display())),
         }
+    }
+
+    pub fn openers(&self) -> Vec<Opener> {
+        self.openers.clone().unwrap_or_else(Opener::defaults)
     }
 
     pub fn base_dir(&self) -> Result<PathBuf> {
@@ -87,11 +94,17 @@ mod tests {
     #[test]
     fn parses_base_dir_and_manual_model_from_json() {
         let config: Config = serde_json::from_str(
-            r#"{ "baseDir": "~/code", "manualModel": { "orgs": ["acme"], "promptWords": ["acme"] } }"#,
+            r#"{
+                "baseDir": "~/code",
+                "manualModel": { "orgs": ["acme"], "promptWords": ["acme"] },
+                "openers": [{ "name": "RustRover", "command": ["rustrover", "{dir}"], "when": ["Cargo.toml"] }]
+            }"#,
         )
         .unwrap();
         assert_eq!(config.base_dir.as_deref(), Some("~/code"));
         assert_eq!(config.manual_model.orgs, ["acme"]);
+        assert_eq!(config.openers()[0].when, ["Cargo.toml"]);
+        assert_eq!(Config::default().openers().len(), 1);
     }
 
     #[test]

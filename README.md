@@ -24,3 +24,4 @@ Ratatosk reads `~/.config/ratatosk/config.json` (or `$XDG_CONFIG_HOME/ratatosk/c
 
 - `baseDir`: the folder holding `<org>/<repo>` checkouts. Defaults to `~/projects`. `RATATOSK_BASE_DIR` overrides it.
 - `manualModel`: `orgs` and `promptWords` for work where model and effort must be picked by hand. Nothing is preselected for them, and their prompts are never sent to a model router.
+- `openers`: tools Ctrl+O can open a session's folder with (its worktree, or the repo root). Each has a `name`, a `command` in which `{dir}` becomes the folder, and optional `when` file patterns (`*` matches anything) checked against the folder's top level; without `when` a tool is always offered. One fitting tool opens straight away, several open a chooser, and the details band lists the ones that fit. Without `openers`, only the system file manager is offered.

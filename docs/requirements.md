@@ -57,7 +57,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
     - `^G` opens the prompt in `$EDITOR`.
     - Ctrl+Enter starts and attaches right away.
   - Ratatosk's own:
-    - `^O` opens in IntelliJ.
+    - `^O` opens the session's folder (worktree or repo root) with a tool from the config's `openers`. Tools can be limited to folders with certain files at the top (`Cargo.toml`, `pom.xml`, `bleep.yaml`); one fitting tool opens directly, several open a chooser. The details band shows which tools fit.
     - `^P` checks out a PR for review.
     - `^B` starts a rebase session.
     - `^L` moves a session to its repo.

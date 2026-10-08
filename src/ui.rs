@@ -16,7 +16,7 @@ use ratatui::{
 
 use crate::{
     agents::State,
-    app::{App, Focus, Line},
+    app::{App, Choice, Focus, Line},
     launch::{Draft, Field, Repo, Target},
     picker::{Item, Picker},
     place::{Place, Scope},
@@ -61,6 +61,62 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(draft) = &app.draft {
         draw_draft(frame, app, draft);
     }
+    if let Some(choice) = &app.choosing {
+        draw_choice(frame, app, choice);
+    }
+}
+
+fn open_with(app: &App, i: usize) -> String {
+    let names: Vec<&str> = app
+        .fitting
+        .get(i)
+        .into_iter()
+        .flatten()
+        .map(|&o| app.openers[o].name.as_str())
+        .collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("   open with {} · ctrl+o", names.join(", "))
+    }
+}
+
+fn draw_choice(frame: &mut Frame, app: &App, choice: &Choice) {
+    let mut lines: Vec<TextLine> = choice
+        .options
+        .iter()
+        .enumerate()
+        .map(|(n, &o)| {
+            let line = TextLine::from(vec![
+                Span::raw(format!(" {} ", n + 1)).dim(),
+                Span::raw(app.openers[o].name.clone()),
+            ]);
+            if n == choice.cursor {
+                line.patch_style(Style::new().add_modifier(Modifier::REVERSED))
+            } else {
+                line
+            }
+        })
+        .collect();
+    lines.push(TextLine::default());
+    lines.push(TextLine::from(" ↑↓ and enter, or a number · esc to cancel").dim());
+    let width = lines
+        .iter()
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(20)
+        .max(36)
+        + 4;
+    let area = centered(frame.area(), width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" open {} ", tilde(&choice.dir.to_string_lossy())).bold())
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        area,
+    );
 }
 
 const MENU_WIDTH: u16 = 28;
@@ -286,6 +342,7 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         TextLine::from(vec![
             label("folder"),
             Span::raw(tilde(&session.cwd.to_string_lossy())),
+            Span::raw(open_with(app, i)).dim(),
         ]),
     ];
     let prs = app.prs_for(i);
@@ -470,7 +527,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_empty() {
         [
             "↑↓ to select · enter or → to attach · ←/→ on a group collapses/expands · tab for projects",
-            "ctrl+r to rename · ctrl+x to stop, twice to delete · type to start a session · esc to quit",
+            "ctrl+o to open · ctrl+r to rename · ctrl+x to stop, twice to delete · type to start a session · esc to quit",
         ]
     } else {
         ["enter to review and start", "esc to clear"]
