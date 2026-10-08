@@ -159,6 +159,11 @@ impl Picker {
         self.reset_cursor(repos);
     }
 
+    pub fn set_filter(&mut self, repos: &[Repo], filter: String) {
+        self.filter = filter;
+        self.reset_cursor(repos);
+    }
+
     pub fn backspace(&mut self, repos: &[Repo]) {
         self.filter.pop();
         self.reset_cursor(repos);

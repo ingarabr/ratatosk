@@ -176,20 +176,7 @@ impl App {
             }
             KeyCode::Esc if self.input.is_empty() => return Action::Quit,
             KeyCode::Esc => self.input.clear(),
-            KeyCode::Enter if !self.input.trim().is_empty() => {
-                let target = self
-                    .selected_repo()
-                    .or_else(|| self.scope_repo())
-                    .map(Target::Repo);
-                let recent = self.recent_repos();
-                self.draft = Some(Draft::new(
-                    self.input.trim().to_string(),
-                    target,
-                    recent,
-                    &self.repos,
-                    self.manual_model.clone(),
-                ));
-            }
+            KeyCode::Enter if !self.input.trim().is_empty() => self.open_draft(),
             KeyCode::Enter => return self.attach_selected(),
             KeyCode::Right if self.input.is_empty() => return self.attach_selected(),
             KeyCode::Backspace => {
@@ -208,6 +195,25 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    fn open_draft(&mut self) {
+        let (target, org) = match &self.scope {
+            Scope::Repo { .. } => (self.scope_repo().or_else(|| self.selected_repo()), None),
+            Scope::Org(org) => (None, Some(org.clone())),
+            Scope::All | Scope::Outside => (self.selected_repo(), None),
+        };
+        let mut draft = Draft::new(
+            self.input.trim().to_string(),
+            target.map(Target::Repo),
+            self.recent_repos(),
+            &self.repos,
+            self.manual_model.clone(),
+        );
+        if let Some(org) = org {
+            draft.picker.set_filter(&self.repos, format!("{org}/"));
+        }
+        self.draft = Some(draft);
     }
 
     fn on_draft_key(&mut self, key: KeyEvent) -> Action {
@@ -863,5 +869,69 @@ mod pr_tests {
             prs.iter().map(|p| (p.number, p.state)).collect::<Vec<_>>(),
             [(12, PrState::Open), (99, PrState::Unknown)]
         );
+    }
+}
+
+#[cfg(test)]
+mod draft_scope_tests {
+    use ratatui::crossterm::event::KeyEvent;
+
+    use super::*;
+    use crate::launch::Field;
+
+    fn app(scope: Scope) -> App {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        app.repos = ["acme/billing", "acme/admin", "globex/engine"]
+            .iter()
+            .map(|label| {
+                let (org, name) = label.split_once('/').unwrap();
+                Repo {
+                    org: org.into(),
+                    name: name.into(),
+                    dir: PathBuf::from("/p").join(label),
+                }
+            })
+            .collect();
+        app.sessions.push(Session {
+            id: "a1".into(),
+            name: "engine work".into(),
+            state: State::Done,
+            cwd: PathBuf::from("/p/globex/engine"),
+            started_at_ms: None,
+            detail: None,
+            prs: Vec::new(),
+        });
+        app.rebuild(None);
+        app.scope = scope;
+        app.input = "start something".into();
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app
+    }
+
+    #[test]
+    fn a_repo_filter_preselects_that_repo() {
+        let app = app(Scope::Repo {
+            org: "acme".into(),
+            repo: "admin".into(),
+        });
+        assert_eq!(app.draft.unwrap().target, Some(Target::Repo(1)));
+    }
+
+    #[test]
+    fn an_org_filter_opens_the_picker_on_that_org() {
+        let app = app(Scope::Org("acme".into()));
+        let draft = app.draft.unwrap();
+        assert_eq!(draft.target, None);
+        assert_eq!(draft.field, Field::Project);
+        assert_eq!(draft.picker.filter, "acme/");
+    }
+
+    #[test]
+    fn without_a_filter_the_selected_session_repo_is_used() {
+        let app = app(Scope::All);
+        assert_eq!(app.draft.unwrap().target, Some(Target::Repo(2)));
     }
 }

@@ -74,7 +74,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   - the generated name;
   - where the session starts (worktree or branch);
   - the exact `claude --bg` command.
-- The project defaults to the selected session's repo, or to the scope selected in the project menu.
+- The project follows the project menu: with a repo selected there, that repo is preselected; with an org selected, the picker opens filtered to `<org>/`, so typing a name offers a new folder in that org. With no filter, the project defaults to the selected session's repo.
 - Picking a project never means stepping through every repo with the arrow keys. The project picker shows:
   - a filter line with a cursor, visible as soon as the project field has focus;
   - a "recent" section: projects sessions were last started in (kept in `~/.local/state/ratatosk/recent`), then the repos of current sessions;
