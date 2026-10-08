@@ -165,11 +165,15 @@ impl App {
             match key.code {
                 KeyCode::Up => return self.step_scope(-1),
                 KeyCode::Down => return self.step_scope(1),
-                KeyCode::Char(' ') if self.input.is_empty() => {
-                    self.toggle_org();
+                KeyCode::Left if self.input.is_empty() => {
+                    self.menu_left();
                     return Action::None;
                 }
-                KeyCode::Right | KeyCode::Enter | KeyCode::Esc => {
+                KeyCode::Right if self.input.is_empty() => {
+                    self.menu_right();
+                    return Action::None;
+                }
+                KeyCode::Enter | KeyCode::Esc => {
                     self.focus = Focus::List;
                     return Action::None;
                 }
@@ -177,7 +181,7 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Left if self.input.is_empty() => self.focus = Focus::Menu,
+            KeyCode::Left if self.input.is_empty() => self.list_left(),
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
             KeyCode::Char('r') if ctrl => {
@@ -188,10 +192,9 @@ impl App {
             KeyCode::Esc if self.input.is_empty() => return Action::Quit,
             KeyCode::Esc => self.input.clear(),
             KeyCode::Enter if !self.input.trim().is_empty() => self.open_draft(),
-            KeyCode::Char(' ') if self.input.is_empty() => self.toggle_group(),
             KeyCode::Enter if self.selected_index().is_none() => self.toggle_group(),
             KeyCode::Enter => return self.attach_selected(),
-            KeyCode::Right if self.input.is_empty() => return self.attach_selected(),
+            KeyCode::Right if self.input.is_empty() => return self.list_right(),
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -576,20 +579,57 @@ impl App {
         self.table.select(self.header_line(&group));
     }
 
-    fn toggle_org(&mut self) {
-        let org = match &self.scope {
-            Scope::Org(org) | Scope::Repo { org, .. } => org.clone(),
-            Scope::All | Scope::Outside => return,
+    fn list_left(&mut self) {
+        match self.lines.get(self.table.selected().unwrap_or(usize::MAX)) {
+            Some(Line::Header(group)) if !self.collapsed.groups.contains(group) => {
+                self.toggle_group()
+            }
+            _ => self.focus = Focus::Menu,
+        }
+    }
+
+    fn list_right(&mut self) -> Action {
+        let Some(at) = self.table.selected() else {
+            return Action::None;
         };
-        if !self.collapsed.orgs.remove(&org) {
-            self.collapsed.orgs.insert(org.clone());
-            if matches!(self.scope, Scope::Repo { .. }) {
+        match self.lines.get(at) {
+            Some(Line::Header(group)) if self.collapsed.groups.contains(group) => {
+                self.toggle_group()
+            }
+            Some(Line::Header(_)) => {
+                if matches!(self.lines.get(at + 1), Some(Line::Session(_))) {
+                    self.table.select(Some(at + 1));
+                }
+            }
+            Some(Line::Session(_)) => return self.attach_selected(),
+            None => {}
+        }
+        Action::None
+    }
+
+    fn menu_left(&mut self) {
+        match self.scope.clone() {
+            Scope::Org(org) if !self.collapsed.orgs.contains(&org) => {
+                self.collapsed.orgs.insert(org);
+                self.save_collapsed();
+            }
+            Scope::Repo { org, .. } => {
                 self.scope = Scope::Org(org);
                 let keep = self.selected_session().map(|s| s.id.clone());
                 self.layout(keep.as_deref());
             }
+            _ => {}
         }
-        self.save_collapsed();
+    }
+
+    fn menu_right(&mut self) {
+        match self.scope.clone() {
+            Scope::Org(org) if self.collapsed.orgs.contains(&org) => {
+                self.collapsed.orgs.remove(&org);
+                self.save_collapsed();
+            }
+            _ => self.focus = Focus::List,
+        }
     }
 
     fn save_collapsed(&mut self) {
@@ -1048,10 +1088,10 @@ mod collapse_tests {
     }
 
     #[test]
-    fn space_collapses_the_selected_group_and_enter_on_its_header_expands_it() {
+    fn left_collapses_a_group_header_and_right_expands_it() {
         let mut app = app();
         press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Left);
         assert_eq!(
             shown(&app),
             [
@@ -1063,32 +1103,71 @@ mod collapse_tests {
             ]
         );
         assert_eq!(app.table.selected(), Some(2));
-        assert!(app.input.is_empty());
-        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.focus, Focus::List);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            app.focus,
+            Focus::Menu,
+            "left on a collapsed group goes on to the menu"
+        );
+        app.focus = Focus::List;
+        press(&mut app, KeyCode::Right);
         assert!(shown(&app).contains(&"a".to_string()));
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.selected_session().map(|s| s.id.as_str()),
+            Some("a"),
+            "right on an open group enters it"
+        );
     }
 
     #[test]
-    fn collapsing_an_org_in_the_menu_hides_its_repos() {
+    fn left_on_a_session_opens_the_menu() {
+        let mut app = app();
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.focus, Focus::Menu);
+    }
+
+    #[test]
+    fn menu_arrows_collapse_and_expand_orgs() {
         let mut app = app();
         app.focus = Focus::Menu;
         app.scope = Scope::Repo {
             org: "acme".into(),
             repo: "billing".into(),
         };
-        press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.scope, Scope::Org("acme".into()));
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            app.scope,
+            Scope::Org("acme".into()),
+            "left on a repo goes to its org"
+        );
+        press(&mut app, KeyCode::Left);
         assert!(
             !app.visible_scopes()
                 .iter()
                 .any(|s| matches!(s, Scope::Repo { org, .. } if org == "acme"))
         );
-        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Right);
         assert!(
             app.visible_scopes()
                 .iter()
                 .any(|s| matches!(s, Scope::Repo { org, .. } if org == "acme"))
         );
+        assert_eq!(app.focus, Focus::Menu);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.focus,
+            Focus::List,
+            "right on an open org goes to the list"
+        );
+    }
+
+    #[test]
+    fn space_types_into_the_prompt() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.input, " ");
     }
 
     #[test]
