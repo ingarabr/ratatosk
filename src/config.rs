@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -14,6 +15,7 @@ pub struct Config {
     pub base_dir: Option<String>,
     pub manual_model: ManualModel,
     pub openers: Option<Vec<Opener>>,
+    pub org_aliases: HashMap<String, String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -21,12 +23,20 @@ pub struct Config {
 pub struct ManualModel {
     pub orgs: Vec<String>,
     pub prompt_words: Vec<String>,
+    #[serde(skip)]
+    pub aliases: HashMap<String, String>,
 }
 
 impl ManualModel {
     pub fn applies(&self, prompt: &str, org: Option<&str>) -> bool {
         let prompt = prompt.to_lowercase();
-        org.is_some_and(|org| self.orgs.iter().any(|o| o == org))
+        let canonical = |org: &str| {
+            self.aliases
+                .get(org)
+                .cloned()
+                .unwrap_or_else(|| org.to_string())
+        };
+        org.is_some_and(|org| self.orgs.iter().any(|o| canonical(o) == canonical(org)))
             || self
                 .prompt_words
                 .iter()
@@ -44,6 +54,13 @@ impl Config {
                 .with_context(|| format!("invalid config in {}", path.display())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err).with_context(|| format!("could not read {}", path.display())),
+        }
+    }
+
+    pub fn manual_model(&self) -> ManualModel {
+        ManualModel {
+            aliases: self.org_aliases.clone(),
+            ..self.manual_model.clone()
         }
     }
 
@@ -97,13 +114,15 @@ mod tests {
             r#"{
                 "baseDir": "~/code",
                 "manualModel": { "orgs": ["acme"], "promptWords": ["acme"] },
-                "openers": [{ "name": "RustRover", "command": ["rustrover", "{dir}"], "when": ["Cargo.toml"] }]
+                "openers": [{ "name": "RustRover", "command": ["rustrover", "{dir}"], "when": ["Cargo.toml"] }],
+                "orgAliases": { "acme-folder": "acme" }
             }"#,
         )
         .unwrap();
         assert_eq!(config.base_dir.as_deref(), Some("~/code"));
         assert_eq!(config.manual_model.orgs, ["acme"]);
         assert_eq!(config.openers()[0].when, ["Cargo.toml"]);
+        assert_eq!(config.manual_model().aliases["acme-folder"], "acme");
         assert_eq!(Config::default().openers().len(), 1);
     }
 
@@ -117,10 +136,15 @@ mod tests {
         let rule = ManualModel {
             orgs: vec!["acme".into()],
             prompt_words: vec!["Acme".into()],
+            aliases: HashMap::from([("acme-folder".to_string(), "acme".to_string())]),
         };
         assert!(rule.applies("fix it", Some("acme")));
         assert!(rule.applies("fix the ACME invoice", Some("other")));
         assert!(!rule.applies("fix it", Some("other")));
+        assert!(
+            rule.applies("fix it", Some("acme-folder")),
+            "an aliased folder org counts as its org"
+        );
         assert!(!ManualModel::default().applies("acme", Some("acme")));
     }
 

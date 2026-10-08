@@ -2,6 +2,7 @@ mod agents;
 mod app;
 mod config;
 mod git;
+mod identity;
 mod launch;
 mod names;
 mod open;
@@ -37,7 +38,7 @@ use app::{Action, App, Line};
 fn main() -> Result<()> {
     let config = config::Config::load()?;
     let base = config.base_dir()?;
-    let mut app = App::new(base, config.manual_model.clone(), config.openers());
+    let mut app = App::new(base, &config);
     app.request_prs(Instant::now());
     if std::env::args().nth(1).as_deref() == Some("--list") {
         while app.prs_pending() {
@@ -139,7 +140,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                     app.status = Some(match app.openers[opener].launch(&dir) {
                         Ok(()) => format!(
                             "opened {} in {}",
-                            tilde_path(&dir),
+                            place::tilde(&dir),
                             app.openers[opener].name
                         ),
                         Err(err) => format!("{err:#}"),
@@ -213,14 +214,6 @@ fn print_list(app: App) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn tilde_path(dir: &Path) -> String {
-    let dir = dir.to_string_lossy();
-    match std::env::var("HOME") {
-        Ok(home) if dir.starts_with(&home) => format!("~{}", &dir[home.len()..]),
-        _ => dir.into_owned(),
-    }
 }
 
 #[cfg(test)]

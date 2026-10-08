@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -8,7 +9,9 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     config::ManualModel,
+    identity::{Resolver, clone_score},
     picker::{Item, Picker},
+    place::Kind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,28 +19,54 @@ pub struct Repo {
     pub org: String,
     pub name: String,
     pub dir: PathBuf,
+    pub kind: Kind,
+    pub folder_org: String,
+    pub folder: String,
 }
 
 impl Repo {
     pub fn label(&self) -> String {
         format!("{}/{}", self.org, self.name)
     }
+
+    pub fn folder_label(&self) -> String {
+        format!("{}/{}", self.folder_org, self.folder)
+    }
 }
 
-pub fn discover(base: &Path) -> Vec<Repo> {
-    let mut repos: Vec<Repo> = subdirs(base)
-        .iter()
-        .flat_map(|org| {
-            subdirs(org)
-                .into_iter()
-                .filter(|dir| dir.join(".git").exists())
-                .map(|dir| Repo {
-                    org: name_of(org),
-                    name: name_of(&dir),
-                    dir,
-                })
-        })
-        .collect();
+// Every project folder under <base>/<org>/, named by its identity. Several clones of one repo
+// become one entry: the clone whose folder is named most like the repo.
+pub fn discover(base: &Path, resolver: &mut Resolver) -> Vec<Repo> {
+    let mut by_identity: HashMap<(String, String), Repo> = HashMap::new();
+    for org_dir in subdirs(base) {
+        let folder_org = name_of(&org_dir);
+        for dir in subdirs(&org_dir) {
+            let folder = name_of(&dir);
+            let id = resolver.identify(&dir, &folder_org, &folder);
+            let candidate = Repo {
+                org: id.org,
+                name: id.repo,
+                dir,
+                kind: id.kind,
+                folder_org: folder_org.clone(),
+                folder,
+            };
+            let key = (candidate.org.clone(), candidate.name.clone());
+            let better = by_identity.get(&key).is_none_or(|kept| {
+                (
+                    clone_score(&candidate.folder, &candidate.name),
+                    std::cmp::Reverse(candidate.folder.len()),
+                ) > (
+                    clone_score(&kept.folder, &kept.name),
+                    std::cmp::Reverse(kept.folder.len()),
+                )
+            });
+            if better {
+                by_identity.insert(key, candidate);
+            }
+        }
+    }
+    let mut repos: Vec<Repo> = by_identity.into_values().collect();
     repos.sort_by_key(Repo::label);
     repos
 }
@@ -165,6 +194,14 @@ impl Target {
         }
     }
 
+    // The folder, which stays put when a repo's GitHub name changes; the recent list uses it.
+    pub fn key(&self, repos: &[Repo]) -> String {
+        match self {
+            Self::Repo(i) => repos[*i].folder_label(),
+            Self::New { org, name } => format!("{org}/{name}"),
+        }
+    }
+
     fn dir(&self, base: &Path, repos: &[Repo]) -> PathBuf {
         match self {
             Self::Repo(i) => repos[*i].dir.clone(),
@@ -266,7 +303,7 @@ impl Draft {
         Some(Launch {
             dir: target.dir(base, repos),
             create: matches!(target, Target::New { .. }),
-            label: target.label(repos),
+            label: target.key(repos),
             prompt: self.prompt.clone(),
             model: self.model?,
             effort: self.effort?,
@@ -339,6 +376,7 @@ mod tests {
         ManualModel {
             orgs: vec!["acme".into()],
             prompt_words: vec!["acme".into()],
+            ..Default::default()
         }
     }
 
@@ -351,6 +389,9 @@ mod tests {
                     org: org.into(),
                     name: name.into(),
                     dir: PathBuf::from("/p").join(label),
+                    kind: crate::place::Kind::Folder,
+                    folder_org: org.into(),
+                    folder: name.into(),
                 }
             })
             .collect()

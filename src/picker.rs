@@ -53,7 +53,10 @@ impl Picker {
             let mut items: Vec<Item> = repos
                 .iter()
                 .enumerate()
-                .filter(|(_, repo)| repo.label().to_lowercase().contains(&filter))
+                .filter(|(_, repo)| {
+                    repo.label().to_lowercase().contains(&filter)
+                        || repo.folder_label().to_lowercase().contains(&filter)
+                })
                 .map(|(i, _)| Item::Repo(i))
                 .collect();
             items.extend(self.create_options(repos));
@@ -82,15 +85,20 @@ impl Picker {
 
     fn create_options(&self, repos: &[Repo]) -> Vec<Item> {
         let filter = self.filter.trim();
+        let folder_orgs: BTreeSet<String> = repos.iter().map(|r| r.folder_org.clone()).collect();
         let (orgs, name): (Vec<String>, &str) = match filter.split_once('/') {
-            Some((org, name)) => (orgs(repos).into_iter().filter(|o| o == org).collect(), name),
-            None => (orgs(repos).into_iter().collect(), filter),
+            Some((org, name)) => (folder_orgs.into_iter().filter(|o| o == org).collect(), name),
+            None => (folder_orgs.into_iter().collect(), filter),
         };
         if !valid_name(name) {
             return Vec::new();
         }
         orgs.into_iter()
-            .filter(|org| !repos.iter().any(|r| &r.org == org && r.name == name))
+            .filter(|org| {
+                !repos
+                    .iter()
+                    .any(|r| &r.folder_org == org && r.folder == name)
+            })
             .map(|org| Item::Create {
                 org,
                 name: name.to_string(),
@@ -202,6 +210,9 @@ mod tests {
                 org: org.into(),
                 name: name.into(),
                 dir: PathBuf::from("/p").join(label),
+                kind: crate::place::Kind::Folder,
+                folder_org: org.into(),
+                folder: name.into(),
             }
         })
         .collect()

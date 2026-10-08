@@ -1,13 +1,52 @@
 {
   "baseDir": "~/projects",
   "manualModel": {
-    "orgs": ["acme"],
-    "promptWords": ["acme"]
+    "orgs": [
+      "acme"
+    ],
+    "promptWords": [
+      "acme"
+    ]
   },
   "openers": [
-    { "name": "IntelliJ IDEA", "command": ["idea", "{dir}"], "when": ["pom.xml", "build.gradle*", "build.sbt"] },
-    { "name": "RustRover", "command": ["rustrover", "{dir}"], "when": ["Cargo.toml"] },
-    { "name": "VS Code", "command": ["code", "{dir}"] },
-    { "name": "Finder", "command": ["open", "{dir}"] }
-  ]
+    {
+      "name": "IntelliJ IDEA",
+      "command": [
+        "idea",
+        "{dir}"
+      ],
+      "when": [
+        "pom.xml",
+        "build.gradle*",
+        "build.sbt"
+      ]
+    },
+    {
+      "name": "RustRover",
+      "command": [
+        "rustrover",
+        "{dir}"
+      ],
+      "when": [
+        "Cargo.toml"
+      ]
+    },
+    {
+      "name": "VS Code",
+      "command": [
+        "code",
+        "{dir}"
+      ]
+    },
+    {
+      "name": "Finder",
+      "command": [
+        "open",
+        "{dir}"
+      ]
+    }
+  ],
+  "orgAliases": {
+    "acme": "acme-corp"
+  }
 }

@@ -17,8 +17,14 @@ Start by doing what `claude agents` does today, then add features as they're nee
 ## Layout and grouping
 
 - A config file sets the base directory, `~/projects` by default. Ratatosk works the same wherever it's started from. Nothing specific to one person's setup belongs in the code; it goes in the config.
-- The first level under the base directory is the org, e.g. `~/projects/<org>/<repo>`. It's the top level of the project menu.
-- The git remote decides which repo a directory is, not the folder name. A folder can be named differently from its GitHub repo, or be a second clone of a repo already checked out elsewhere. Show the GitHub name, and keep the folder name as an alias.
+- Sessions are grouped by org, then repo:
+  - a git repo whose `origin` is on GitHub: the GitHub owner and repo name;
+  - any other folder at `<base>/<org>/<project>` (no remote, another host, or not git at all): the folder names;
+  - a session directly in the base folder or an org folder: a group named after that folder (e.g. `~/projects`);
+  - a session outside the base folder: "elsewhere".
+- `orgAliases` in the config maps folder or GitHub org names to the org to group under, so folder-only repos can join their GitHub org's group.
+- Several clones of one repo count as the same repo. The main clone, used by the new-session picker, is the folder named most like the repo.
+- Icons tell group kinds apart: GitHub mark, git, folder.
 - Each repo has a worktree policy:
   - `worktree`: new sessions get a worktree under `<repo>/.claude/worktrees/<name>`.
   - `main-checkout`: a new branch from `origin/main` in the main checkout.

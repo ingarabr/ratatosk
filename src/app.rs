@@ -12,8 +12,9 @@ use ratatui::{
 
 use crate::{
     agents::{self, Session, State},
-    config::ManualModel,
+    config::{Config, ManualModel},
     git,
+    identity::Resolver,
     launch::{self, Draft, Field, Launch, Repo, Target},
     names,
     open::{self, Opener},
@@ -81,6 +82,7 @@ pub struct App {
     pub openers: Vec<Opener>,
     pub fitting: Vec<Vec<usize>>,
     pub choosing: Option<Choice>,
+    pub resolver: Resolver,
 }
 
 pub struct Choice {
@@ -90,9 +92,10 @@ pub struct Choice {
 }
 
 impl App {
-    pub fn new(base: PathBuf, manual_model: ManualModel, openers: Vec<Opener>) -> Self {
+    pub fn new(base: PathBuf, config: &Config) -> Self {
+        let mut resolver = Resolver::new(config.org_aliases.clone());
         let mut app = Self {
-            repos: launch::discover(&base),
+            repos: launch::discover(&base, &mut resolver),
             base,
             sessions: Vec::new(),
             places: Vec::new(),
@@ -108,7 +111,7 @@ impl App {
             focus: Focus::List,
             scopes: vec![Scope::All],
             scope: Scope::All,
-            manual_model,
+            manual_model: config.manual_model(),
             names: names::path().map(|p| names::load(&p)).unwrap_or_default(),
             names_path: names::path(),
             claude_names: HashMap::new(),
@@ -121,9 +124,10 @@ impl App {
                 .map(|p| ViewState::load(&p))
                 .unwrap_or_default(),
             view_path: ViewState::path(),
-            openers,
+            openers: config.openers(),
             fitting: Vec::new(),
             choosing: None,
+            resolver,
         };
         app.refresh();
         app
@@ -245,7 +249,7 @@ impl App {
         let (target, org) = match &self.scope {
             Scope::Repo { .. } => (self.scope_repo().or_else(|| self.selected_repo()), None),
             Scope::Org(org) => (None, Some(org.clone())),
-            Scope::All | Scope::Outside => (self.selected_repo(), None),
+            Scope::All | Scope::Loose(_) | Scope::Elsewhere => (self.selected_repo(), None),
         };
         let mut draft = Draft::new(
             self.input.trim().to_string(),
@@ -314,7 +318,11 @@ impl App {
             .map(recent::load)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|label| self.repos.iter().position(|r| r.label() == label));
+            .filter_map(|label| {
+                self.repos
+                    .iter()
+                    .position(|r| r.folder_label() == label || r.label() == label)
+            });
         let mut by_session: Vec<usize> = (0..self.sessions.len()).collect();
         by_session.sort_by_key(|&i| std::cmp::Reverse(self.sessions[i].started_at_ms));
         let from_sessions = by_session
@@ -324,7 +332,7 @@ impl App {
                     .repos
                     .iter()
                     .position(|r| &r.org == org && &r.name == repo),
-                Place::Outside => None,
+                _ => None,
             });
         let mut recent = Vec::new();
         for i in remembered.chain(from_sessions) {
@@ -382,8 +390,8 @@ impl App {
 
     pub fn repo_dir(&self, i: usize) -> Option<PathBuf> {
         match &self.places[i] {
-            Place::Repo { org, repo, .. } => Some(self.base.join(org).join(repo)),
-            Place::Outside => None,
+            Place::Repo { project, .. } => Some(project.clone()),
+            _ => None,
         }
     }
 
@@ -514,15 +522,30 @@ impl App {
                 .repos
                 .iter()
                 .position(|r| &r.org == org && &r.name == repo),
-            Place::Outside => None,
+            _ => None,
         }
     }
 
     fn rebuild(&mut self, keep: Option<&str>) {
+        let (base, resolver) = (&self.base, &mut self.resolver);
         self.places = self
             .sessions
             .iter()
-            .map(|s| Place::of(&self.base, &s.cwd))
+            .map(|s| {
+                let mut place = Place::of(base, &s.cwd);
+                if let Place::Repo {
+                    org,
+                    repo,
+                    kind,
+                    project,
+                    ..
+                } = &mut place
+                {
+                    let id = resolver.identify(project, org, repo);
+                    (*org, *repo, *kind) = (id.org, id.repo, id.kind);
+                }
+                place
+            })
             .collect();
         let mut by_dir: HashMap<PathBuf, Option<String>> = HashMap::new();
         self.branches = self
@@ -534,7 +557,7 @@ impl App {
                     .entry(session.cwd.clone())
                     .or_insert_with(|| git::branch(&session.cwd))
                     .clone(),
-                Place::Outside => None,
+                _ => None,
             })
             .collect();
         let mut by_root: HashMap<PathBuf, Vec<usize>> = HashMap::new();
@@ -568,7 +591,11 @@ impl App {
                 Sort::Name => std::cmp::Reverse(0),
             };
             (
-                matches!(place, Place::Outside),
+                match place {
+                    Place::Repo { .. } => 0,
+                    Place::Loose(_) => 1,
+                    Place::Elsewhere => 2,
+                },
                 place.group(),
                 recency,
                 session.name.to_lowercase(),
@@ -628,24 +655,9 @@ impl App {
     }
 
     pub fn root_dir(&self, i: usize) -> PathBuf {
-        match &self.places[i] {
-            Place::Repo {
-                org,
-                repo,
-                worktree: Some(name),
-            } => self
-                .base
-                .join(org)
-                .join(repo)
-                .join(".claude/worktrees")
-                .join(name),
-            Place::Repo {
-                org,
-                repo,
-                worktree: None,
-            } => self.base.join(org).join(repo),
-            Place::Outside => self.sessions[i].cwd.clone(),
-        }
+        self.places[i]
+            .root()
+            .unwrap_or_else(|| self.sessions[i].cwd.clone())
     }
 
     fn open_selected(&mut self) -> Action {
@@ -845,7 +857,7 @@ mod tests {
             .collect();
         App {
             base: PathBuf::from("/p"),
-            places: vec![Place::Outside; sessions.len()],
+            places: vec![Place::Elsewhere; sessions.len()],
             branches: vec![None; sessions.len()],
             lines: (0..sessions.len()).map(Line::Session).collect(),
             sessions,
@@ -1128,6 +1140,9 @@ mod draft_scope_tests {
                     org: org.into(),
                     name: name.into(),
                     dir: PathBuf::from("/p").join(label),
+                    kind: crate::place::Kind::Folder,
+                    folder_org: org.into(),
+                    folder: name.into(),
                 }
             })
             .collect();

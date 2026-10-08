@@ -19,7 +19,7 @@ use crate::{
     app::{App, Choice, Focus, Line},
     launch::{Draft, Field, Repo, Target},
     picker::{Item, Picker},
-    place::{Place, Scope},
+    place::{Kind, Place, Scope},
     pr::{Pr, PrState},
 };
 
@@ -28,6 +28,10 @@ const PLACEHOLDER: &str = "describe a task for a new session";
 const WORKTREE: &str = "\u{f418}";
 // Nerd Font octicons for pull request states.
 const PR_OPEN: &str = "\u{f407}";
+// Nerd Font icons for what a group is: a GitHub repo, a local git repo, or a plain folder.
+const ICON_GITHUB: &str = "\u{f408}";
+const ICON_GIT: &str = "\u{e702}";
+const ICON_FOLDER: &str = "\u{f413}";
 const PR_DRAFT: &str = "\u{f4dd}";
 const PR_MERGED: &str = "\u{f419}";
 const PR_CLOSED: &str = "\u{f4dc}";
@@ -143,15 +147,31 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
                     } else {
                         "▾ "
                     },
-                    org.clone(),
+                    format!("{} {org}", kind_icon(org_kind(app, org))),
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
-                Scope::Repo { repo, .. } => ("    ", repo.clone(), Style::new()),
-                Scope::Outside => (
-                    "! ",
-                    "not in a repo".to_string(),
-                    Style::new().fg(Color::Yellow),
+                Scope::Repo { org, repo } => {
+                    let kind = app.places.iter().find_map(|p| match p {
+                        Place::Repo {
+                            org: o,
+                            repo: r,
+                            kind,
+                            ..
+                        } if o == org && r == repo => Some(*kind),
+                        _ => None,
+                    });
+                    (
+                        "    ",
+                        format!("{} {repo}", kind_icon(kind.unwrap_or_default())),
+                        Style::new(),
+                    )
+                }
+                Scope::Loose(dir) => (
+                    "  ",
+                    format!("{ICON_FOLDER} {}", tilde(&dir.to_string_lossy())),
+                    Style::new(),
                 ),
+                Scope::Elsewhere => ("  ", format!("{ICON_FOLDER} elsewhere"), Style::new()),
             };
             let line = TextLine::from(vec![
                 Span::raw(indent),
@@ -189,9 +209,17 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = view.lines.iter().map(|line| match line {
         Line::Header(group) => {
             let collapsed = view.view.collapsed_groups.contains(group);
+            let icon = view
+                .places
+                .iter()
+                .find(|p| p.group() == *group)
+                .map_or(ICON_FOLDER, |p| match p {
+                    Place::Repo { kind, .. } => kind_icon(*kind),
+                    _ => ICON_FOLDER,
+                });
             Row::new(vec![Cell::from(TextLine::from(vec![
                 Span::styled(
-                    format!("{} {group}", if collapsed { "▸" } else { "▾" }),
+                    format!("{} {icon} {group}", if collapsed { "▸" } else { "▾" }),
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(if collapsed {
@@ -313,10 +341,12 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             org,
             repo,
             worktree,
+            kind,
+            ..
         } => {
             let mut spans = vec![
                 label("repo"),
-                Span::raw(format!("{org}/{repo}")),
+                Span::raw(format!("{} {org}/{repo}", kind_icon(*kind))),
                 Span::raw("   "),
             ];
             spans.push(match worktree {
@@ -332,10 +362,23 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
             }
             TextLine::from(spans)
         }
-        Place::Outside => TextLine::from(vec![
+        Place::Loose(dir) => TextLine::from(vec![
             label("repo"),
-            Span::raw("not in a repo").yellow(),
-            Span::raw(" · started outside the repos, so no repo skills or settings").dim(),
+            Span::raw("none").yellow(),
+            Span::raw(format!(
+                " · started in {}, outside any project, so no repo skills or settings",
+                tilde(&dir.to_string_lossy())
+            ))
+            .dim(),
+        ]),
+        Place::Elsewhere => TextLine::from(vec![
+            label("repo"),
+            Span::raw("none").yellow(),
+            Span::raw(format!(
+                " · started outside {}",
+                tilde(&app.base.to_string_lossy())
+            ))
+            .dim(),
         ]),
     };
     let mut lines = vec![
@@ -710,10 +753,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn tilde(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
-        _ => path.to_string(),
-    }
+    crate::place::tilde(std::path::Path::new(path))
 }
 
 fn shell_words(args: &[String]) -> String {
@@ -781,6 +821,29 @@ fn pr_word(state: PrState) -> &'static str {
         PrState::Closed => "closed",
         PrState::Unknown => "state unknown",
     }
+}
+
+fn kind_icon(kind: Kind) -> &'static str {
+    match kind {
+        Kind::GitHub => ICON_GITHUB,
+        Kind::Git => ICON_GIT,
+        Kind::Folder => ICON_FOLDER,
+    }
+}
+
+fn org_kind(app: &App, org: &str) -> Kind {
+    let kinds: Vec<Kind> = app
+        .places
+        .iter()
+        .filter_map(|p| match p {
+            Place::Repo { org: o, kind, .. } if o == org => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    [Kind::GitHub, Kind::Git]
+        .into_iter()
+        .find(|k| kinds.contains(k))
+        .unwrap_or(Kind::Folder)
 }
 
 fn state_style(state: State) -> Style {
@@ -852,11 +915,11 @@ mod tests {
                 detail: Some("awaiting go-ahead to push".into()),
                 prs: Vec::new(),
             }],
-            places: vec![Place::Repo {
-                org: "acme".into(),
-                repo: "billing".into(),
-                worktree: Some("credit-note-api".into()),
-            }],
+            places: vec![crate::place::repo(
+                "acme",
+                "billing",
+                Some("credit-note-api"),
+            )],
             branches: vec![Some("credit-note-api".into())],
             lines: vec![Line::Header("acme / billing".into()), Line::Session(0)],
             table: TableState::default().with_selected(Some(1)),
@@ -865,6 +928,9 @@ mod tests {
                 org: "globex".into(),
                 name: "engine".into(),
                 dir: PathBuf::from("/p/globex/engine"),
+                kind: crate::place::Kind::Folder,
+                folder_org: "globex".into(),
+                folder: "engine".into(),
             }],
             input: String::new(),
             draft: None,
