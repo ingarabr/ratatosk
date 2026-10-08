@@ -11,6 +11,7 @@ mod place;
 mod pr;
 mod recent;
 mod state;
+mod trust;
 mod ui;
 
 use std::{
@@ -99,25 +100,14 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                     app.refresh();
                     app.request_prs(Instant::now());
                 }
-                Action::Start { launch, open } => match launch.start() {
-                    Ok(stdout) => {
-                        app.remember(&launch.label);
-                        app.input.clear();
-                        app.draft = None;
-                        app.refresh();
-                        if let Some((id, cwd)) = app.select_started(&stdout)
-                            && open
-                        {
-                            attach(terminal, &id, &cwd)?;
-                            app.refresh();
-                        }
+                Action::Start { launch, open } => start(terminal, &mut app, &launch, open)?,
+                Action::Trust { launch, open } => {
+                    if launch.create {
+                        let _ = std::fs::create_dir_all(&launch.dir);
                     }
-                    Err(err) => {
-                        if let Some(draft) = app.draft.as_mut() {
-                            draft.notice = Some(format!("{err:#}"));
-                        }
-                    }
-                },
+                    run_claude_in(terminal, &launch.dir)?;
+                    start(terminal, &mut app, &launch, open)?;
+                }
                 Action::Stop { id } => {
                     app.status = Some(match agents::stop(&id) {
                         Ok(_) => {
@@ -151,6 +141,62 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
             _ => {}
         }
     }
+}
+
+fn start(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    launch: &launch::Launch,
+    open: bool,
+) -> Result<()> {
+    let refused = |app: &mut App, message: String| {
+        if let Some(draft) = app.draft.as_mut() {
+            draft.needs_trust = true;
+            draft.notice = Some(message);
+        }
+    };
+    let folder = place::tilde(&launch.dir);
+    let ask = format!(
+        "Claude Code doesn't trust {folder} yet. Enter opens Claude there: accept its trust prompt, type /exit, and the session starts."
+    );
+    if !launch.create && trust::is_trusted(&launch.dir) == Some(false) {
+        refused(app, ask);
+        return Ok(());
+    }
+    match launch.start() {
+        Ok(stdout) => {
+            app.remember(&launch.label);
+            app.input.clear();
+            app.draft = None;
+            app.refresh();
+            if let Some((id, cwd)) = app.select_started(&stdout)
+                && open
+            {
+                attach(terminal, &id, &cwd)?;
+                app.refresh();
+            }
+        }
+        Err(err) if trust::is_trust_error(&format!("{err:#}")) => refused(app, ask),
+        Err(err) => {
+            if let Some(draft) = app.draft.as_mut() {
+                draft.notice = Some(format!("{err:#}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+// An interactive `claude`, so its trust prompt can be answered; the user leaves with /exit.
+fn run_claude_in(terminal: &mut DefaultTerminal, dir: &Path) -> Result<()> {
+    restore();
+    let waited = Command::new("claude")
+        .current_dir(dir)
+        .spawn()
+        .context("could not run `claude`")
+        .and_then(|child| wait_detaching_on_stop(child.id() as libc::pid_t));
+    *terminal = init()?;
+    terminal.clear()?;
+    waited
 }
 
 // Run from the session's own directory: from anywhere else Claude Code asks to trust the

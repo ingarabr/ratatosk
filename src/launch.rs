@@ -218,6 +218,7 @@ pub struct Draft {
     pub effort: Option<Effort>,
     pub field: Field,
     pub notice: Option<String>,
+    pub needs_trust: bool,
     rule: ManualModel,
     model_picked: bool,
     effort_picked: bool,
@@ -243,6 +244,7 @@ impl Draft {
             model: None,
             effort: None,
             notice: None,
+            needs_trust: false,
             model_picked: false,
             effort_picked: false,
             rule,
@@ -274,6 +276,7 @@ impl Draft {
             _ => return,
         };
         self.target = Some(target);
+        self.needs_trust = false;
         self.field = Field::Model;
         self.apply_rule(repos);
     }

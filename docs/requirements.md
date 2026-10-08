@@ -89,6 +89,8 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   - "all projects" as a tree of orgs, collapsed by default. → opens an org, ← closes it, Enter picks a repo.
 - Typing filters across all repos. The list also offers `+ new folder <org>/<name>`, and `org/name` narrows that to one org. Ratatosk creates the folder only when the session actually starts.
 - Tab and Shift+Tab move between project, model and effort.
+- Claude Code starts a background session only in a folder whose trust prompt was accepted for that exact folder (a trusted parent doesn't count), and Ratatosk never accepts it on the user's behalf. It checks the flag in `~/.claude.json` before starting, and when the folder isn't trusted (or `claude --bg` refuses), the confirmation says so: Enter then opens an interactive `claude` there to answer the prompt, and once the user types `/exit` Ratatosk starts the session.
+- The prompt line wraps and grows up to eight lines. Shift+Enter, Alt+Enter or Ctrl+J insert a newline. The confirmation shows the prompt, the command and any message wrapped in full.
 - Model routing:
   - The config's `manualModel` section lists orgs and prompt words. A prompt or project that matches one is never sent to a model router, and model and effort have to be picked by hand.
   - Any other prompt can get a router's suggestion for project, model and effort, when one is configured.

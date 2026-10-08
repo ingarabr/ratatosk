@@ -42,10 +42,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         0
     };
+    let prompt_height = prompt_lines(app, frame.area().width).len() as u16 + 2;
     let [details, body, prompt, hints] = Layout::vertical([
         Constraint::Length(details_height),
         Constraint::Fill(1),
-        Constraint::Length(3),
+        Constraint::Length(prompt_height),
         Constraint::Length(2),
     ])
     .areas(frame.area());
@@ -459,34 +460,75 @@ fn link(buf: &mut Buffer, area: Rect, y: u16, text: &str, url: &str) {
         .set_diff_option(CellDiffOption::ForcedWidth(width));
 }
 
+fn text_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+// Wraps at spaces, keeps newlines, breaks words longer than a line, and cuts to `max_lines`
+// with an ellipsis.
 fn wrap_clipped(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut words = text.split_whitespace().peekable();
-    while let Some(word) = words.next() {
-        let candidate = if current.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current} {word}")
-        };
-        if Span::raw(candidate.as_str()).width() <= width {
-            current = candidate;
-            continue;
+    for paragraph in text.split('\n') {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let mut word = word.to_string();
+            loop {
+                let candidate = if current.is_empty() {
+                    word.clone()
+                } else {
+                    format!("{current} {word}")
+                };
+                if text_width(&candidate) <= width {
+                    current = candidate;
+                    break;
+                }
+                if !current.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                    continue;
+                }
+                let head: String = word
+                    .chars()
+                    .scan(0, |w, c| {
+                        *w += text_width(&c.to_string());
+                        (*w <= width).then_some(c)
+                    })
+                    .collect();
+                word = word[head.len()..].to_string();
+                lines.push(head);
+            }
         }
-        if lines.len() + 1 == max_lines {
-            lines.push(ellipsize(&candidate, width));
-            return lines;
-        }
-        lines.push(std::mem::replace(&mut current, word.to_string()));
-        if words.peek().is_none() && lines.len() == max_lines {
-            break;
-        }
-    }
-    if !current.is_empty() {
         lines.push(current);
     }
+    if lines.len() > max_lines {
+        let rest = lines[max_lines].clone();
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            *last = ellipsize(&format!("{last} {rest}"), width);
+        }
+    }
     lines
+}
+
+fn labelled(
+    label: &str,
+    text: &str,
+    width: usize,
+    max_lines: usize,
+    style: Style,
+) -> Vec<TextLine<'static>> {
+    wrap_clipped(text, width.saturating_sub(label.len()), max_lines)
+        .into_iter()
+        .enumerate()
+        .map(|(n, line)| {
+            let head = if n == 0 {
+                label.to_string()
+            } else {
+                " ".repeat(label.len())
+            };
+            TextLine::from(vec![Span::raw(head).dim(), Span::styled(line, style)])
+        })
+        .collect()
 }
 
 fn ellipsize(text: &str, width: usize) -> String {
@@ -509,38 +551,47 @@ fn state_word(state: State) -> &'static str {
     }
 }
 
+const PROMPT_MAX_LINES: usize = 8;
+
+fn prompt_lines(app: &App, width: u16) -> Vec<String> {
+    if app.input.is_empty() {
+        return vec![PLACEHOLDER.to_string()];
+    }
+    let lines = wrap_clipped(&app.input, (width as usize).saturating_sub(3), usize::MAX);
+    let skip = lines.len().saturating_sub(PROMPT_MAX_LINES);
+    lines.into_iter().skip(skip).collect()
+}
+
 fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).dim();
     let inner = block.inner(area);
-    let room = (inner.width as usize).saturating_sub(3);
-    let shown = if app.input.is_empty() {
-        Span::raw(PLACEHOLDER).dim()
-    } else if Span::raw(app.input.as_str()).width() <= room {
-        Span::raw(app.input.clone())
+    let lines = prompt_lines(app, inner.width);
+    let style = if app.input.is_empty() {
+        Style::new().add_modifier(Modifier::DIM)
     } else {
-        let tail: String = app
-            .input
-            .chars()
-            .rev()
-            .take(room.saturating_sub(1))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        Span::raw(format!("…{tail}"))
+        Style::new()
     };
-    let typed = if app.input.is_empty() {
-        0
-    } else {
-        shown.width() as u16
-    };
+    let text: Vec<TextLine> = lines
+        .iter()
+        .enumerate()
+        .map(|(n, line)| {
+            TextLine::from(vec![
+                Span::raw(if n == 0 { "❯ " } else { "  " }).dim(),
+                Span::styled(line.clone(), style),
+            ])
+        })
+        .collect();
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(TextLine::from(vec![Span::raw("❯ ").dim(), shown])),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(text), inner);
     if app.draft.is_none() {
-        frame.set_cursor_position((inner.x + 2 + typed, inner.y));
+        let last = lines.len().saturating_sub(1);
+        let trailing_space = u16::from(app.input.ends_with(' '));
+        let col = if app.input.is_empty() {
+            0
+        } else {
+            text_width(&lines[last]) as u16 + trailing_space
+        };
+        frame.set_cursor_position((inner.x + 2 + col, inner.y + last as u16));
     }
 }
 
@@ -574,7 +625,10 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
             "ctrl+o to open · ctrl+r to rename · ctrl+s to sort · ctrl+x to stop, twice to delete · esc to quit",
         ]
     } else {
-        ["enter to review and start", "esc to clear"]
+        [
+            "enter to review and start · shift+enter (or ctrl+j) for a new line",
+            "esc to clear",
+        ]
     };
     frame.render_widget(
         Paragraph::new(hints.map(TextLine::from).to_vec()).dim(),
@@ -583,6 +637,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 const PICKER_ROWS: usize = 12;
+const DRAFT_WIDTH: u16 = 100;
 
 fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
     let repos = &app.repos;
@@ -607,14 +662,15 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
         ])
     };
 
-    let mut lines = vec![
-        TextLine::from(vec![
-            Span::raw("  prompt   ").dim(),
-            Span::raw(draft.prompt.as_str()),
-        ]),
-        TextLine::default(),
-        field(Field::Project, "project", target.map(|t| t.label(repos))),
-    ];
+    let box_width = frame.area().width.min(DRAFT_WIDTH);
+    let text_room = box_width.saturating_sub(4) as usize;
+    let mut lines = labelled("  prompt   ", &draft.prompt, text_room, 6, Style::new());
+    lines.push(TextLine::default());
+    lines.push(field(
+        Field::Project,
+        "project",
+        target.map(|t| t.label(repos)),
+    ));
     let mut cursor = None;
     if picking {
         let filter_line = TextLine::from(vec![
@@ -653,15 +709,16 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
         Span::raw("  starts in ").dim(),
         Span::raw(starts_in),
     ]));
-    lines.push(TextLine::from(vec![
-        Span::raw("  runs      ").dim(),
-        Span::raw(
-            launch
-                .map(|l| format!("claude {}", shell_words(&l.args())))
-                .unwrap_or_default(),
-        )
-        .dim(),
-    ]));
+    let command = launch
+        .map(|l| format!("claude {}", shell_words(&l.args())))
+        .unwrap_or_default();
+    lines.extend(labelled(
+        "  runs      ",
+        &command,
+        text_room,
+        3,
+        Style::new().add_modifier(Modifier::DIM),
+    ));
     if draft.manual(repos) {
         lines.push(
             TextLine::from(
@@ -671,19 +728,24 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
         );
     }
     if let Some(notice) = &draft.notice {
-        lines.push(TextLine::from(format!("  {notice}")).red());
+        let color = if draft.needs_trust {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        lines.extend(labelled("  ", notice, text_room, 4, Style::new().fg(color)));
     }
     lines.push(TextLine::default());
     lines.push(
         TextLine::from(if picking {
             "  type to filter · ↑↓ move · → open · ← close · enter to pick · tab to next field · esc back"
         } else {
-            "  ↑↓ or tab field · ←→ change · enter to start · ctrl+enter to start and open · esc back"
+            "  ↑↓ or tab field · ←→ change · enter to start (or trust) · ctrl+enter to start and open · esc back"
         })
         .dim(),
     );
 
-    let area = centered(frame.area(), 100, lines.len() as u16 + 2);
+    let area = centered(frame.area(), box_width, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -1071,12 +1133,42 @@ mod tests {
     }
 
     #[test]
-    fn a_long_prompt_shows_its_end() {
+    fn a_long_prompt_wraps_over_several_lines_and_keeps_newlines() {
         let mut app = app();
-        app.input = format!("{} the end", "x".repeat(200));
+        app.input = format!("{} the end\nsecond line", "word ".repeat(60));
+        let lines = prompt_lines(&app, 80);
+        assert!(lines.len() > 2, "{lines:?}");
+        assert_eq!(lines.last().map(String::as_str), Some("second line"));
         let screen = screen(&mut app);
-        assert!(screen.contains("…"), "{screen}");
         assert!(screen.contains("the end"), "{screen}");
+        assert!(screen.contains("second line"), "{screen}");
+    }
+
+    #[test]
+    fn wrapping_breaks_long_words_and_respects_newlines() {
+        let lines = wrap_clipped(&format!("{}\nnext", "x".repeat(25)), 10, usize::MAX);
+        assert_eq!(lines, ["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx", "next"]);
+    }
+
+    #[test]
+    fn the_confirmation_shows_a_long_message_in_full() {
+        let mut app = app();
+        app.input = "fix the parser".into();
+        let mut draft = Draft::new(
+            app.input.clone(),
+            Some(Target::Repo(0)),
+            Vec::new(),
+            &app.repos,
+            Default::default(),
+        );
+        draft.needs_trust = true;
+        draft.notice = Some(format!(
+            "Claude Code doesn't trust {} yet. Enter opens Claude there: accept its trust prompt, type /exit, and the session starts.",
+            "/p/a/very/long/path/to/a/folder/that/goes/on"
+        ));
+        app.draft = Some(draft);
+        let screen = screen(&mut app);
+        assert!(screen.contains("and the session starts."), "{screen}");
     }
 
     #[test]

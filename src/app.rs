@@ -45,6 +45,7 @@ pub enum Action {
     Quit,
     Attach { id: String, cwd: PathBuf },
     Start { launch: Launch, open: bool },
+    Trust { launch: Launch, open: bool },
     Stop { id: String },
     Open { opener: usize, dir: PathBuf },
     Delete { id: String },
@@ -226,6 +227,14 @@ impl App {
             }
             KeyCode::Esc if self.input.is_empty() => return Action::Quit,
             KeyCode::Esc => self.input.clear(),
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.input.push('\n')
+            }
+            KeyCode::Char('j') if ctrl => self.input.push('\n'),
             KeyCode::Enter if !self.input.trim().is_empty() => self.open_draft(),
             KeyCode::Enter if self.selected_index().is_none() => self.toggle_group(),
             KeyCode::Enter => return self.attach_selected(),
@@ -272,6 +281,7 @@ impl App {
             return Action::None;
         };
         let start = |draft: &mut Draft, open: bool| match draft.launch(base, repos) {
+            Some(launch) if draft.needs_trust => Action::Trust { launch, open },
             Some(launch) => Action::Start { launch, open },
             None => {
                 draft.notice = Some("pick a project, model and effort first".to_string());
@@ -1462,5 +1472,52 @@ mod sort_tests {
             ["beta", "alpha", "gamma"],
             "newest first, groups kept"
         );
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use ratatui::crossterm::event::KeyEvent;
+
+    use super::*;
+
+    #[test]
+    fn shift_enter_and_ctrl_j_add_newlines() {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        app.on_key(KeyEvent::from(KeyCode::Char('a')));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::from(KeyCode::Char('b')));
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "a\nb\n");
+        assert!(app.draft.is_none());
+    }
+
+    #[test]
+    fn a_folder_claude_refused_turns_enter_into_trust() {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        app.repos = vec![Repo {
+            org: "acme".into(),
+            name: "billing".into(),
+            dir: PathBuf::from("/p/acme/billing"),
+            kind: crate::place::Kind::Folder,
+            folder_org: "acme".into(),
+            folder: "billing".into(),
+        }];
+        app.input = "fix it".into();
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let draft = app.draft.as_mut().unwrap();
+        draft.target = Some(Target::Repo(0));
+        draft.needs_trust = true;
+        draft.field = crate::launch::Field::Effort;
+        assert!(matches!(
+            app.on_key(KeyEvent::from(KeyCode::Enter)),
+            Action::Trust { .. }
+        ));
     }
 }
