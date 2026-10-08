@@ -465,11 +465,11 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.focus == Focus::Menu {
         [
             "↑↓ to pick a project · the list follows · ← collapses an org, → opens it",
-            "→ on anything else, or enter, goes back to the list",
+            "tab, enter, or → on anything else goes back to the list",
         ]
     } else if app.input.is_empty() {
         [
-            "↑↓ to select · enter or → to attach · ←/→ on a group collapses/expands · ← for projects",
+            "↑↓ to select · enter or → to attach · ←/→ on a group collapses/expands · tab for projects",
             "ctrl+r to rename · ctrl+x to stop, twice to delete · type to start a session · esc to quit",
         ]
     } else {

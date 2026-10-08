@@ -44,8 +44,8 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   - with an empty prompt, attaches to the selected session.
 - `→` attaches.
 - `↑` and `↓` select. PgUp/PgDn and Home/End also work. Alt+↑/↓ jumps between groups.
-- `←` moves into the project menu. `→` or Enter goes back to the list.
-- Tab and Shift+Tab switch views: sessions, needs me, PRs, worktrees.
+- Tab and Shift+Tab switch between the project menu and the list. `←` on a session also opens the menu; `→` or Enter goes back to the list.
+- Views (sessions, needs me, PRs, worktrees) need keys of their own, since Tab switches panels.
 - `n:` in the prompt filters by text. `#123` filters by PR. Esc clears the prompt.
 - Actions use Ctrl.
   - These match the agents view:

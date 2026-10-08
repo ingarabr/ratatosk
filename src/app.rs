@@ -161,6 +161,13 @@ impl App {
             return self.on_draft_key(key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = match self.focus {
+                Focus::List => Focus::Menu,
+                Focus::Menu => Focus::List,
+            };
+            return Action::None;
+        }
         if self.focus == Focus::Menu {
             match key.code {
                 KeyCode::Up => return self.step_scope(-1),
@@ -1161,6 +1168,17 @@ mod collapse_tests {
             Focus::List,
             "right on an open org goes to the list"
         );
+    }
+
+    #[test]
+    fn tab_switches_between_the_menu_and_the_list() {
+        let mut app = app();
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Menu);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::List);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.focus, Focus::Menu);
     }
 
     #[test]
