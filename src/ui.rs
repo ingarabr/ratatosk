@@ -76,19 +76,23 @@ fn draw_menu(frame: &mut Frame, app: &App, area: Rect) {
             Style::new()
         });
     let lines: Vec<TextLine> = app
-        .scopes
-        .iter()
+        .visible_scopes()
+        .into_iter()
         .map(|scope| {
             let (indent, label, style) = match scope {
                 Scope::All => ("", tilde(&app.base.to_string_lossy()), Style::new()),
                 Scope::Org(org) => (
-                    " ",
+                    if app.collapsed.orgs.contains(org) {
+                        "▸ "
+                    } else {
+                        "▾ "
+                    },
                     org.clone(),
                     Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
-                Scope::Repo { repo, .. } => ("   ", repo.clone(), Style::new()),
+                Scope::Repo { repo, .. } => ("    ", repo.clone(), Style::new()),
                 Scope::Outside => (
-                    " ",
+                    "! ",
                     "not in a repo".to_string(),
                     Style::new().fg(Color::Yellow),
                 ),
@@ -127,9 +131,19 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = view.lines.iter().map(|line| match line {
         Line::Header(group) => {
-            Row::new(vec![Cell::from(group.as_str()).style(
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )])
+            let collapsed = view.collapsed.groups.contains(group);
+            Row::new(vec![Cell::from(TextLine::from(vec![
+                Span::styled(
+                    format!("{} {group}", if collapsed { "▸" } else { "▾" }),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(if collapsed {
+                    format!("  {}", view.group_count(group))
+                } else {
+                    String::new()
+                })
+                .dim(),
+            ]))])
         }
         Line::Session(i) => {
             let session = &view.sessions[*i];
@@ -455,7 +469,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
         ]
     } else if app.input.is_empty() {
         [
-            "↑↓ to select · enter to attach · ← for projects · ctrl+z in a session to come back",
+            "↑↓ to select · enter to attach · space to collapse a group · ← for projects · ctrl+z to come back",
             "ctrl+r to rename · ctrl+x to stop, twice to delete · type to start a session · esc to quit",
         ]
     } else {

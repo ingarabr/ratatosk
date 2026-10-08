@@ -32,6 +32,7 @@ Start by doing what `claude agents` does today, then add features as they're nee
 - Sessions started from `~/projects` get a flag. Ratatosk guesses their repo, and an action resumes them there (`claude --bg --resume` from the repo directory).
 - Each row shows state, name, a PR icon with the PR number, model and age. The details pane shows working directory, branch, uncommitted changes, PR status and what the session is waiting for.
 - A "needs me" view lists blocked sessions and what each one waits for.
+- Groups collapse, for screen sharing among other things. In the list, group headers are selectable and Space (with an empty prompt) or Enter on a header collapses or expands the group; a collapsed group shows only its header and session count. In the project menu, Space collapses an org's repos. Collapsed groups and orgs are remembered in `~/.local/state/ratatosk/collapsed.json`.
 
 ## Keys
 

@@ -19,6 +19,7 @@ use crate::{
     place::{Place, Scope},
     pr::{self, Pr, PrState, RepoPrs},
     recent,
+    state::Collapsed,
 };
 
 const RECENT_SHOWN: usize = 6;
@@ -73,6 +74,8 @@ pub struct App {
     pub dir_repos: HashMap<PathBuf, String>,
     pub pr_lookup: Option<Receiver<pr::Found>>,
     pub prs_requested: Option<Instant>,
+    pub collapsed: Collapsed,
+    pub collapsed_path: Option<PathBuf>,
 }
 
 impl App {
@@ -103,6 +106,10 @@ impl App {
             dir_repos: HashMap::new(),
             pr_lookup: None,
             prs_requested: None,
+            collapsed: Collapsed::path()
+                .map(|p| Collapsed::load(&p))
+                .unwrap_or_default(),
+            collapsed_path: Collapsed::path(),
         };
         app.refresh();
         app
@@ -158,6 +165,10 @@ impl App {
             match key.code {
                 KeyCode::Up => return self.step_scope(-1),
                 KeyCode::Down => return self.step_scope(1),
+                KeyCode::Char(' ') if self.input.is_empty() => {
+                    self.toggle_org();
+                    return Action::None;
+                }
                 KeyCode::Right | KeyCode::Enter | KeyCode::Esc => {
                     self.focus = Focus::List;
                     return Action::None;
@@ -177,6 +188,8 @@ impl App {
             KeyCode::Esc if self.input.is_empty() => return Action::Quit,
             KeyCode::Esc => self.input.clear(),
             KeyCode::Enter if !self.input.trim().is_empty() => self.open_draft(),
+            KeyCode::Char(' ') if self.input.is_empty() => self.toggle_group(),
+            KeyCode::Enter if self.selected_index().is_none() => self.toggle_group(),
             KeyCode::Enter => return self.attach_selected(),
             KeyCode::Right if self.input.is_empty() => return self.attach_selected(),
             KeyCode::Backspace => {
@@ -187,11 +200,8 @@ impl App {
             KeyCode::Down => self.step(1, 1),
             KeyCode::PageUp => self.step(-1, 10),
             KeyCode::PageDown => self.step(1, 10),
-            KeyCode::Home => self.table.select(self.first_session_line()),
-            KeyCode::End => {
-                let last = self.session_lines().last();
-                self.table.select(last);
-            }
+            KeyCode::Home if !self.lines.is_empty() => self.table.select(Some(0)),
+            KeyCode::End if !self.lines.is_empty() => self.table.select(Some(self.lines.len() - 1)),
             _ => {}
         }
         Action::None
@@ -520,29 +530,94 @@ impl App {
             let group = places[i].group();
             if current.as_ref() != Some(&group) {
                 lines.push(Line::Header(group.clone()));
-                current = Some(group);
+                current = Some(group.clone());
             }
-            lines.push(Line::Session(i));
+            if !self.collapsed.groups.contains(&group) {
+                lines.push(Line::Session(i));
+            }
         }
         self.lines = lines;
 
         let kept = keep.and_then(|id| {
+            let session = self.sessions.iter().position(|s| s.id == id)?;
             self.lines
                 .iter()
-                .position(|line| matches!(line, Line::Session(i) if self.sessions[*i].id == id))
+                .position(|line| matches!(line, Line::Session(i) if *i == session))
+                .or_else(|| self.header_line(&self.places[session].group()))
         });
-        let first = self.first_session_line();
+        let first = self
+            .first_session_line()
+            .or((!self.lines.is_empty()).then_some(0));
         self.table.select(kept.or(first));
     }
 
-    fn step_scope(&mut self, direction: isize) -> Action {
-        let at = self
-            .scopes
+    fn header_line(&self, group: &str) -> Option<usize> {
+        self.lines
             .iter()
-            .position(|s| *s == self.scope)
-            .unwrap_or(0) as isize;
-        let next = (at + direction).clamp(0, self.scopes.len() as isize - 1) as usize;
-        self.scope = self.scopes[next].clone();
+            .position(|line| matches!(line, Line::Header(g) if g == group))
+    }
+
+    fn selected_group(&self) -> Option<String> {
+        match self.lines.get(self.table.selected()?)? {
+            Line::Header(group) => Some(group.clone()),
+            Line::Session(i) => Some(self.places[*i].group()),
+        }
+    }
+
+    fn toggle_group(&mut self) {
+        let Some(group) = self.selected_group() else {
+            return;
+        };
+        if !self.collapsed.groups.remove(&group) {
+            self.collapsed.groups.insert(group.clone());
+        }
+        self.save_collapsed();
+        self.layout(None);
+        self.table.select(self.header_line(&group));
+    }
+
+    fn toggle_org(&mut self) {
+        let org = match &self.scope {
+            Scope::Org(org) | Scope::Repo { org, .. } => org.clone(),
+            Scope::All | Scope::Outside => return,
+        };
+        if !self.collapsed.orgs.remove(&org) {
+            self.collapsed.orgs.insert(org.clone());
+            if matches!(self.scope, Scope::Repo { .. }) {
+                self.scope = Scope::Org(org);
+                let keep = self.selected_session().map(|s| s.id.clone());
+                self.layout(keep.as_deref());
+            }
+        }
+        self.save_collapsed();
+    }
+
+    fn save_collapsed(&mut self) {
+        if let Some(path) = &self.collapsed_path
+            && let Err(err) = self.collapsed.save(path)
+        {
+            self.error = Some(format!("could not save collapsed groups: {err}"));
+        }
+    }
+
+    pub fn visible_scopes(&self) -> Vec<&Scope> {
+        self.scopes
+            .iter()
+            .filter(|scope| !matches!(scope, Scope::Repo { org, .. } if self.collapsed.orgs.contains(org)))
+            .collect()
+    }
+
+    pub fn group_count(&self, group: &str) -> usize {
+        (0..self.sessions.len())
+            .filter(|&i| self.scope.matches(&self.places[i]) && self.places[i].group() == group)
+            .count()
+    }
+
+    fn step_scope(&mut self, direction: isize) -> Action {
+        let visible: Vec<Scope> = self.visible_scopes().into_iter().cloned().collect();
+        let at = visible.iter().position(|s| *s == self.scope).unwrap_or(0) as isize;
+        let next = (at + direction).clamp(0, visible.len() as isize - 1) as usize;
+        self.scope = visible[next].clone();
         let keep = self.selected_session().map(|s| s.id.clone());
         self.layout(keep.as_deref());
         Action::None
@@ -575,21 +650,12 @@ impl App {
     }
 
     fn step(&mut self, direction: isize, times: usize) {
-        let Some(mut at) = self.table.selected() else {
-            return self.table.select(self.first_session_line());
-        };
-        for _ in 0..times {
-            let next = if direction > 0 {
-                self.session_lines().find(|&i| i > at)
-            } else {
-                self.session_lines().rev().find(|&i| i < at)
-            };
-            match next {
-                Some(i) => at = i,
-                None => break,
-            }
+        if self.lines.is_empty() {
+            return;
         }
-        self.table.select(Some(at));
+        let at = self.table.selected().unwrap_or(0) as isize;
+        let next = (at + direction * times as isize).clamp(0, self.lines.len() as isize - 1);
+        self.table.select(Some(next as usize));
     }
 }
 
@@ -933,5 +999,108 @@ mod draft_scope_tests {
     fn without_a_filter_the_selected_session_repo_is_used() {
         let app = app(Scope::All);
         assert_eq!(app.draft.unwrap().target, Some(Target::Repo(2)));
+    }
+}
+
+#[cfg(test)]
+mod collapse_tests {
+    use ratatui::crossterm::event::KeyEvent;
+
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App {
+            base: PathBuf::from("/p"),
+            ..Default::default()
+        };
+        for (id, cwd) in [
+            ("a", "/p/acme/billing"),
+            ("b", "/p/acme/billing"),
+            ("c", "/p/acme/admin"),
+            ("d", "/p/globex/engine"),
+        ] {
+            app.sessions.push(Session {
+                id: id.into(),
+                name: id.into(),
+                state: State::Done,
+                cwd: PathBuf::from(cwd),
+                started_at_ms: None,
+                detail: None,
+                prs: Vec::new(),
+            });
+        }
+        app.rebuild(None);
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    fn shown(app: &App) -> Vec<String> {
+        app.lines
+            .iter()
+            .map(|line| match line {
+                Line::Header(group) => format!("[{group}]"),
+                Line::Session(i) => app.sessions[*i].id.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn space_collapses_the_selected_group_and_enter_on_its_header_expands_it() {
+        let mut app = app();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            shown(&app),
+            [
+                "[acme / admin]",
+                "c",
+                "[acme / billing]",
+                "[globex / engine]",
+                "d"
+            ]
+        );
+        assert_eq!(app.table.selected(), Some(2));
+        assert!(app.input.is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert!(shown(&app).contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn collapsing_an_org_in_the_menu_hides_its_repos() {
+        let mut app = app();
+        app.focus = Focus::Menu;
+        app.scope = Scope::Repo {
+            org: "acme".into(),
+            repo: "billing".into(),
+        };
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.scope, Scope::Org("acme".into()));
+        assert!(
+            !app.visible_scopes()
+                .iter()
+                .any(|s| matches!(s, Scope::Repo { org, .. } if org == "acme"))
+        );
+        press(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.visible_scopes()
+                .iter()
+                .any(|s| matches!(s, Scope::Repo { org, .. } if org == "acme"))
+        );
+    }
+
+    #[test]
+    fn collapsed_state_round_trips() {
+        let path = std::env::temp_dir()
+            .join(format!("ratatosk-collapsed-{}", std::process::id()))
+            .join("c.json");
+        let mut collapsed = Collapsed::default();
+        collapsed.groups.insert("acme / billing".into());
+        collapsed.orgs.insert("globex".into());
+        collapsed.save(&path).unwrap();
+        assert_eq!(Collapsed::load(&path), collapsed);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
