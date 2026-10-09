@@ -133,9 +133,11 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
 - The docs say not to parse `~/.claude/jobs/<id>/state.json`, so use it as optional extra detail only. Its `detail` field is the one-line status the agents view shows ("awaiting go-ahead to push"), and the details pane uses it when it can be read.
 - Never talk to the daemon's `control.sock`. Its protocol is private and authenticated.
 - Nothing documented can send a prompt to a running session from outside it. Reaching a session means attaching.
-- Attach by giving the terminal to `claude attach <id>`, run from the session's own directory. No tmux or embedded terminal is needed. Every way out leaves the session running in the background.
-  - Ctrl+Z returns straight to Ratatosk. It stops the `claude attach` client, so Ratatosk ends that client and redraws the list.
-  - ← and `/exit` open Claude's agents view first; Esc there returns to Ratatosk. This is deliberate in Claude Code (since v2.1.198). `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` doesn't change it (tested 2026-10-08), and no flag or setting does.
+- Attach by running `claude attach <id>` in a pseudo-terminal that Ratatosk mirrors onto its own, byte for byte, from the session's own directory. This is what the daemon does one level down: every background session lives in a daemon-owned PTY and `claude attach` is a thin client for it. No tmux or terminal emulator is needed, since nothing is parsed; terminal queries and their replies round-trip to the real terminal. Every way out leaves the session running in the background.
+  - Ratatosk stays on its alternate screen and in raw mode throughout, so the shell's scrollback never flashes between the two. The child's own leave-alternate-screen sequence is dropped from its output, and its kitty keyboard pushes are counted so the ones a hung-up child never popped can be.
+  - Ctrl+Z and Ctrl+] return straight to Ratatosk. They are taken out of the input before the child sees them, in both the legacy byte and the kitty keyboard encoding, and never inside a bracketed paste. Ratatosk then closes the PTY, which ends the client; the agents view that ← turns the client into ignores SIGTERM and Ctrl+Z but ends on that hangup.
+  - ← and `/exit` open Claude's agents view first; Esc there, or a detach key, returns to Ratatosk. This is deliberate in Claude Code (since v2.1.198): ← re-executes the client as `claude agents` in place. `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` doesn't change it (tested 2026-10-08), nor does `leftArrowOpensAgents: false` (tested 2026-10-09), and no flag, keybinding action or hook covers detach.
+  - A mod loaded into the session does run inside `claude attach` and can swallow `/exit` through a `command.run` hook (verified 2026-10-09), so a later step can make `/exit` return to Ratatosk too. Mods cannot see keys or ←.
 - Call `gh` and `git` as commands.
 
 ## Ground rules

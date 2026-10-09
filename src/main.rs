@@ -2,6 +2,7 @@ mod agents;
 mod app;
 mod config;
 mod git;
+mod handoff;
 mod identity;
 mod launch;
 mod names;
@@ -16,13 +17,13 @@ mod ui;
 
 use std::{
     io::stdout,
-    os::unix::process::CommandExt,
     path::Path,
     process::Command,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ratatui::{
     DefaultTerminal,
     crossterm::{
@@ -58,7 +59,7 @@ fn main() -> Result<()> {
 fn init() -> Result<DefaultTerminal> {
     let terminal = ratatui::init();
     execute!(stdout(), EnableFocusChange)?;
-    if supports_keyboard_enhancement().unwrap_or(false) {
+    if keyboard_enhanced() {
         execute!(
             stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -67,8 +68,15 @@ fn init() -> Result<DefaultTerminal> {
     Ok(terminal)
 }
 
+// Asked once: the answer is a round trip through the terminal, and it must not be asked
+// while a child owns the input.
+fn keyboard_enhanced() -> bool {
+    static ENHANCED: OnceLock<bool> = OnceLock::new();
+    *ENHANCED.get_or_init(|| supports_keyboard_enhancement().unwrap_or(false))
+}
+
 fn restore() {
-    if supports_keyboard_enhancement().unwrap_or(false) {
+    if keyboard_enhanced() {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
     let _ = execute!(stdout(), DisableFocusChange);
@@ -192,74 +200,22 @@ fn start(
 fn run_claude_in(terminal: &mut DefaultTerminal, dir: &Path) -> Result<()> {
     let mut cmd = Command::new("claude");
     cmd.current_dir(dir);
-    run_in_terminal(terminal, cmd, || trust::is_trusted(dir) == Some(true))
+    handoff::run(
+        terminal,
+        cmd,
+        || trust::is_trusted(dir) == Some(true),
+        keyboard_enhanced(),
+    )?;
+    Ok(())
 }
 
 // Run from the session's own directory: from anywhere else Claude Code asks to trust the
-// caller's folder before it wakes the session.
+// caller's folder before it wakes the session. Ctrl+Z or Ctrl+] comes back here.
 fn attach(terminal: &mut DefaultTerminal, id: &str, dir: &Path) -> Result<()> {
     let mut cmd = Command::new("claude");
     cmd.args(["attach", id]).current_dir(dir);
-    run_in_terminal(terminal, cmd, || false)
-}
-
-// Hands the terminal to `cmd` until it exits, is suspended, or `done` says it can go.
-//
-// Ctrl+Z in an interactive `claude` suspends the whole foreground job, which includes
-// Ratatosk, so Ratatosk ignores SIGTSTP while the child runs; the child gets the default
-// action back before exec, so its own Ctrl+Z still works.
-fn run_in_terminal(
-    terminal: &mut DefaultTerminal,
-    mut cmd: Command,
-    done: impl Fn() -> bool,
-) -> Result<()> {
-    restore();
-    unsafe {
-        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
-        cmd.pre_exec(|| {
-            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
-            Ok(())
-        });
-    }
-    let waited = cmd
-        .spawn()
-        .context("could not run `claude`")
-        .and_then(|child| wait_for(child.id() as libc::pid_t, done));
-    unsafe {
-        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
-    }
-    *terminal = init()?;
-    terminal.clear()?;
-    waited
-}
-
-// A suspended child is ended rather than left stopped: only a shell would ever resume it, and
-// for `claude attach` the session itself keeps running in the daemon.
-fn wait_for(pid: libc::pid_t, done: impl Fn() -> bool) -> Result<()> {
-    let end = || unsafe {
-        libc::kill(pid, libc::SIGTERM);
-        libc::kill(pid, libc::SIGCONT);
-    };
-    let mut ending = false;
-    loop {
-        let mut status = 0;
-        let got = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
-        if got == -1 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err).context("waiting for `claude`");
-        }
-        if got == pid && !libc::WIFSTOPPED(status) {
-            return Ok(());
-        }
-        if (got == pid || done()) && !ending {
-            end();
-            ending = true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    handoff::run(terminal, cmd, || false, keyboard_enhanced())?;
+    Ok(())
 }
 
 fn print_list(app: App) -> Result<()> {
@@ -285,23 +241,4 @@ fn print_list(app: App) -> Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use super::*;
-
-    #[test]
-    #[expect(clippy::zombie_processes, reason = "wait_for reaps it")]
-    fn a_child_that_stops_itself_is_ended() {
-        let child = Command::new("sh")
-            .args(["-c", "kill -STOP $$; sleep 30"])
-            .spawn()
-            .unwrap();
-        let started = Instant::now();
-        wait_for(child.id() as libc::pid_t, || false).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
 }
