@@ -455,9 +455,7 @@ mod tests {
         );
         draft.cycle(1);
         draft.field = Field::Project;
-        for c in "billing".chars() {
-            draft.picker.type_char(&repos, c);
-        }
+        draft.picker.type_text(&repos, "billing");
         draft.pick_current(&repos);
         assert_eq!(draft.target, Some(Target::Repo(0)));
         assert_eq!(draft.model, Some(Model::Haiku));

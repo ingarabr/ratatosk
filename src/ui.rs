@@ -618,7 +618,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     let hints: [&str; 2] = if app.renaming.is_some() {
         [
             "type the new name · enter to save · esc to cancel",
-            "an empty name goes back to Claude's own name",
+            "opt+⌫ deletes a word · cmd+⌫ clears · an empty name goes back to Claude's own name",
         ]
     } else if app.focus == Focus::Menu {
         [
@@ -633,7 +633,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         [
             "enter to review and start · shift+enter (or ctrl+j) for a new line",
-            "esc to clear",
+            "opt+⌫ deletes a word · cmd+⌫ or esc clears",
         ]
     };
     frame.render_widget(
@@ -1196,9 +1196,7 @@ mod tests {
 
         let repos = app.repos.clone();
         let draft = app.draft.as_mut().unwrap();
-        for c in "newtool".chars() {
-            draft.picker.type_char(&repos, c);
-        }
+        draft.picker.type_text(&repos, "newtool");
         let after = screen(&mut app);
         assert!(after.contains("+ new folder globex/newtool"), "{after}");
     }

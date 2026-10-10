@@ -1,6 +1,7 @@
 mod agents;
 mod app;
 mod config;
+mod edit;
 mod git;
 mod handoff;
 mod identity;

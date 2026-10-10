@@ -70,7 +70,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
     - `^L` moves a session to its repo.
     - `^W` opens the PR on GitHub.
     - `^D` prunes merged worktrees.
-  - Ctrl+A/E/U/K stay as line editing in the prompt.
+  - Line editing is the same in every text field (the prompt, the rename box, the project filter). Option+⌫ (or Ctrl+⌫) deletes the last word; Cmd+⌫ and `^U` clear the field. `^W` is not a word delete here, since it opens the PR. Ghostty sends Cmd+⌫ as `^U` by default, so both are handled. The fields have no cursor, so there is no `^A`/`^E`/`^K`.
 - `?` with an empty prompt shows all keys.
 - The key hints sit in a grid below the prompt line, in the agents view's wording ("ctrl+r to rename").
 

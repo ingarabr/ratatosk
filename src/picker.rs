@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use crate::launch::Repo;
+use ratatui::crossterm::event::KeyEvent;
+
+use crate::{edit, launch::Repo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
@@ -162,18 +164,22 @@ impl Picker {
         }
     }
 
-    pub fn type_char(&mut self, repos: &[Repo], c: char) {
-        self.filter.push(c);
-        self.reset_cursor(repos);
+    pub fn edit(&mut self, repos: &[Repo], key: KeyEvent) {
+        if edit::apply(&mut self.filter, key) {
+            self.reset_cursor(repos);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn type_text(&mut self, repos: &[Repo], text: &str) {
+        use ratatui::crossterm::event::KeyCode;
+        for c in text.chars() {
+            self.edit(repos, KeyEvent::from(KeyCode::Char(c)));
+        }
     }
 
     pub fn set_filter(&mut self, repos: &[Repo], filter: String) {
         self.filter = filter;
-        self.reset_cursor(repos);
-    }
-
-    pub fn backspace(&mut self, repos: &[Repo]) {
-        self.filter.pop();
         self.reset_cursor(repos);
     }
 }
@@ -260,9 +266,7 @@ mod tests {
     fn filtering_lists_matches_then_new_folder_options() {
         let repos = repos();
         let mut picker = Picker::new(Vec::new(), &repos);
-        for c in "ac".chars() {
-            picker.type_char(&repos, c);
-        }
+        picker.type_text(&repos, "ac");
         let items = picker.items(&repos);
         assert_eq!(items[..2], [Item::Repo(0), Item::Repo(1)]);
         assert!(items.contains(&Item::Create {
@@ -275,9 +279,7 @@ mod tests {
     fn no_new_folder_option_where_the_repo_already_exists() {
         let repos = repos();
         let mut picker = Picker::new(Vec::new(), &repos);
-        for c in "billing".chars() {
-            picker.type_char(&repos, c);
-        }
+        picker.type_text(&repos, "billing");
         let items = picker.items(&repos);
         assert_eq!(items[0], Item::Repo(0));
         assert!(!items.contains(&Item::Create {
@@ -294,9 +296,7 @@ mod tests {
     fn org_slash_name_offers_only_that_org() {
         let repos = repos();
         let mut picker = Picker::new(Vec::new(), &repos);
-        for c in "ingarabr/new-tool".chars() {
-            picker.type_char(&repos, c);
-        }
+        picker.type_text(&repos, "ingarabr/new-tool");
         assert_eq!(
             picker.items(&repos),
             [Item::Create {

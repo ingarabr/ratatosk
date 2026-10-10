@@ -13,7 +13,7 @@ use ratatui::{
 use crate::{
     agents::{self, Session, State},
     config::{Config, ManualModel},
-    git,
+    edit, git,
     identity::Resolver,
     launch::{self, Draft, Field, Launch, Repo, Target},
     names,
@@ -239,10 +239,7 @@ impl App {
             KeyCode::Enter if self.selected_index().is_none() => self.toggle_group(),
             KeyCode::Enter => return self.attach_selected(),
             KeyCode::Right if self.input.is_empty() => return self.list_right(),
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if !ctrl => self.input.push(c),
+            _ if edit::apply(&mut self.input, key) => {}
             KeyCode::Up => self.step(-1, 1),
             KeyCode::Down => self.step(1, 1),
             KeyCode::PageUp => self.step(-1, 10),
@@ -301,9 +298,7 @@ impl App {
                 KeyCode::Down => draft.picker.step(repos, 1),
                 KeyCode::Right => draft.picker.open_current(repos),
                 KeyCode::Left => draft.picker.close_current(repos),
-                KeyCode::Backspace => draft.picker.backspace(repos),
-                KeyCode::Char(c) if !ctrl => draft.picker.type_char(repos, c),
-                _ => {}
+                _ => draft.picker.edit(repos, key),
             },
             KeyCode::Enter => return start(draft, false),
             KeyCode::Up => draft.field = draft.field.prev(),
@@ -365,12 +360,9 @@ impl App {
                 self.renaming = None;
                 self.rename(&id, &name);
             }
-            KeyCode::Backspace => {
-                buffer.pop();
+            _ => {
+                edit::apply(buffer, key);
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => buffer.clear(),
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => buffer.push(c),
-            _ => {}
         }
     }
 
@@ -1053,6 +1045,26 @@ mod rename_tests {
         assert_eq!(app.sessions[0].name, "credit notes");
         assert_eq!(app.names["a1"], "credit notes");
         assert_eq!(app.claude_names["a1"], "billing: credit-note");
+    }
+
+    #[test]
+    fn word_and_line_deletion_work_in_the_prompt_and_the_rename_box() {
+        let mut app = app();
+        type_text(&mut app, "fix the tests");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.input, "fix the ");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert!(app.input.is_empty());
+
+        ctrl(&mut app, 'r');
+        ctrl(&mut app, 'u');
+        type_text(&mut app, "credit notes");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(app.renaming.as_ref().unwrap().1, "credit ");
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(app.renaming.as_ref().unwrap().1, "");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.input.is_empty());
     }
 
     #[test]
