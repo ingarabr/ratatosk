@@ -16,10 +16,12 @@ use crate::{
     config::{Config, ManualModel},
     edit, git,
     identity::Resolver,
+    keychain::Keychain,
     launch::{self, Draft, Field, Launch, Repo, Target},
     names,
     open::{self, Opener},
     place::{Place, Scope},
+    pool::{Member, Pool},
     pr::{self, Pr, PrState, RepoPrs},
     recent,
     state::{Sort, ViewState},
@@ -70,6 +72,8 @@ pub enum Action {
         account: usize,
     },
     Move(Move),
+    SwitchAccount(String),
+    SignIn,
 }
 
 // A session that runs on the wrong account, to be resumed on the one its org is pinned to.
@@ -117,6 +121,15 @@ pub struct App {
     pub choosing: Option<Choice>,
     pub resolver: Resolver,
     pub accounts: Accounts,
+    pub pool: Option<Pool>,
+    pub signed_in: Option<Member>,
+    pub picking_account: Option<AccountPicker>,
+}
+
+// The pool's accounts, then a row to sign in to another one.
+pub struct AccountPicker {
+    pub cursor: usize,
+    armed_forget: Option<(usize, Instant)>,
 }
 
 pub struct Choice {
@@ -126,7 +139,7 @@ pub struct Choice {
 }
 
 impl App {
-    pub fn new(base: PathBuf, config: &Config, accounts: Accounts) -> Self {
+    pub fn new(base: PathBuf, config: &Config, accounts: Accounts, pool: Option<Pool>) -> Self {
         let mut resolver = Resolver::new(config.org_aliases.clone());
         let mut app = Self {
             repos: launch::discover(&base, &mut resolver),
@@ -163,6 +176,9 @@ impl App {
             choosing: None,
             resolver,
             accounts,
+            pool,
+            signed_in: None,
+            picking_account: None,
         };
         app.refresh();
         app
@@ -191,6 +207,7 @@ impl App {
             self.sessions = sessions;
         }
         self.error = (!errors.is_empty()).then(|| errors.join(" · "));
+        self.signed_in = self.pool.as_ref().and_then(Pool::active);
         self.rebuild(keep.as_deref());
     }
 
@@ -219,6 +236,9 @@ impl App {
         }
         if self.choosing.is_some() {
             return self.on_choice_key(key);
+        }
+        if self.picking_account.is_some() {
+            return self.on_account_key(key);
         }
         if self.draft.is_some() {
             return self.on_draft_key(key);
@@ -256,6 +276,7 @@ impl App {
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
             KeyCode::Char('o') if ctrl => return self.open_selected(),
             KeyCode::Char('l') if ctrl => return self.move_selected(),
+            KeyCode::Char('a') if ctrl => self.open_accounts(),
             KeyCode::Char('s') if ctrl => {
                 self.view.sort = self.view.sort.next();
                 self.save_view();
@@ -585,6 +606,74 @@ impl App {
             from: session.account,
             to,
         })
+    }
+
+    fn open_accounts(&mut self) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        let active = self.signed_in.as_ref().map(|m| m.email.to_lowercase());
+        let cursor = pool
+            .members
+            .iter()
+            .position(|m| Some(m.email.to_lowercase()) == active)
+            .unwrap_or(0);
+        self.picking_account = Some(AccountPicker {
+            cursor,
+            armed_forget: None,
+        });
+    }
+
+    fn on_account_key(&mut self, key: KeyEvent) -> Action {
+        let (Some(picker), Some(pool)) = (self.picking_account.as_mut(), self.pool.as_mut()) else {
+            return Action::None;
+        };
+        let rows = pool.members.len() + 1;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.picking_account = None,
+            KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down => picker.cursor = (picker.cursor + 1).min(rows - 1),
+            KeyCode::Enter => {
+                let cursor = picker.cursor;
+                self.picking_account = None;
+                return match pool.members.get(cursor) {
+                    Some(member) => Action::SwitchAccount(member.email.clone()),
+                    None => Action::SignIn,
+                };
+            }
+            KeyCode::Char('x') if ctrl && picker.cursor < pool.members.len() => {
+                let now = Instant::now();
+                let email = pool.members[picker.cursor].email.clone();
+                let armed = picker.armed_forget.take().is_some_and(|(row, at)| {
+                    row == picker.cursor && now.duration_since(at) <= DELETE_WINDOW
+                });
+                if !armed {
+                    picker.armed_forget = Some((picker.cursor, now));
+                    self.status = Some(format!(
+                        "ctrl+x again within 2s to forget the stored sign-in for {email}"
+                    ));
+                    return Action::None;
+                }
+                self.status = Some(match pool.forget(&Keychain, &email) {
+                    Ok(()) => format!("forgot {email}; Claude Code's own sign-in is unchanged"),
+                    Err(err) => format!("{err:#}"),
+                });
+                picker.cursor = picker.cursor.min(pool.members.len());
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    // Saves the current sign-in into the pool, freshly read since Claude Code rotates its refresh
+    // token as it uses it. Quiet: a busy lock or a pinned account just skips it. Kept to startup:
+    // a capture that lands inside a `/login` (Keychain written, config not yet) would file the
+    // new tokens under the old email.
+    pub fn sync_pool(&mut self) {
+        if let (Some(pool), Some(_)) = (self.pool.as_mut(), &self.signed_in) {
+            let _ = pool.sync(&Keychain);
+        }
     }
 
     // Keeps Ratatosk's name for a session that came back under a new id.
@@ -997,6 +1086,51 @@ mod tests {
         app.table.select(Some(1));
         assert!(matches!(app.on_key(ctrl_l), Action::None));
         assert!(app.status.unwrap().contains("already runs on"));
+    }
+
+    #[test]
+    fn ctrl_a_picks_an_account_to_switch_to_or_signs_in_to_another() {
+        let mut app = app_with(&["a"]);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.on_key(ctrl('a'));
+        assert!(app.picking_account.is_none(), "no pool, no picker");
+
+        let mut pool = Pool::new(
+            std::path::Path::new("/nowhere"),
+            None,
+            "me".into(),
+            Vec::new(),
+        );
+        pool.members = ["a@acme.example", "b@globex.example"]
+            .map(|email| Member {
+                email: email.into(),
+                organization: None,
+                oauth_account: serde_json::Value::Null,
+            })
+            .to_vec();
+        app.pool = Some(pool);
+        app.signed_in = Some(Member {
+            email: "B@globex.example".into(),
+            organization: None,
+            oauth_account: serde_json::Value::Null,
+        });
+        app.on_key(ctrl('a'));
+        assert_eq!(
+            app.picking_account.as_ref().unwrap().cursor,
+            1,
+            "starts on the active one"
+        );
+        app.on_key(key(KeyCode::Up));
+        assert!(
+            matches!(app.on_key(key(KeyCode::Enter)), Action::SwitchAccount(e) if e == "a@acme.example")
+        );
+        assert!(app.picking_account.is_none());
+
+        app.on_key(ctrl('a'));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Down));
+        assert!(matches!(app.on_key(key(KeyCode::Enter)), Action::SignIn));
     }
 
     fn app_with(ids: &[&str]) -> App {

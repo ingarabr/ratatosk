@@ -68,6 +68,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
     - `^P` checks out a PR for review.
     - `^B` starts a rebase session.
     - `^L` moves a session to its repo, and to the account its org is pinned to.
+    - `^A` switches the account of the default login.
     - `^W` opens the PR on GitHub.
     - `^D` prunes merged worktrees.
   - Line editing is the same in every text field (the prompt, the rename box, the project filter). Option+⌫ (or Ctrl+⌫) deletes the last word; Cmd+⌫ and `^U` clear the field. `^W` is not a word delete here, since it opens the PR. Ghostty sends Cmd+⌫ as `^U` by default, so both are handled. The fields have no cursor, so there is no `^A`/`^E`/`^K`.
@@ -133,7 +134,19 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   3. it resumes it there with `claude --bg --resume <session-id>` from the same folder, after the trust step if needed;
   4. only then does it remove the old one.
   Ratatosk's own name for the session carries over.
-- Later: repos with no pinned account could rotate between several logins, as claude-swap does. Pinned orgs must stay out of that.
+- Every other repo uses the default login (`~/.claude`), and that login can be switched between several accounts: the pool. Ctrl+A opens it.
+  - Enter on an account switches the default login to it. All running sessions on the default login follow within about 30 s, since Claude Code caches its Keychain read for 30 s and re-reads it on a 401; nothing needs a restart. Sessions of pinned orgs are untouched.
+  - The current login joins the pool by itself. "Sign in to another account" runs `claude auth login` under a throwaway `CLAUDE_CONFIG_DIR` and copies the result into the pool, so the default login is never touched while you sign in. Never `/logout`: it revokes the refresh token.
+  - Ctrl+X twice forgets an account's stored login.
+  - The list title shows the account of the default login, and the start confirmation names the account a session will start on.
+- A switch replaces what Claude Code reads its login from: the `claudeAiOauth` key inside the Keychain item `Claude Code-credentials` (account `$USER`), and the `oauthAccount` key of `~/.claude.json`. The rest of the Keychain item (MCP and gateway tokens) belongs to the machine and stays, as do settings, trust, history, plugins and the daemon.
+  - Claude Code rotates the refresh token whenever it refreshes. The login being left is therefore saved, freshly read, at every switch, and Ratatosk saves the active one again at startup. A stored copy that went stale anyway (a switch made outside Ratatosk) needs a new sign-in.
+  - It cooperates with Claude Code's locks (checked against 2.1.308), which are npm proper-lockfile directories: `~/.claude/.oauth_refresh.lock`, then `<realpath of ~/.claude>.lock`, both stale after 60 s (token refresh); `~/.claude/.storage-write.lock`, stale after 15 s (every read-modify-write of the Keychain item); and `~/.claude.json.lock`, stale after 10 s. Ratatosk takes them in that order, and like Claude Code it lets go of the first when the second is busy, so neither side waits while holding what the other needs. The storage-write and config locks are only tried, never waited on: Claude Code gives up on them after a few seconds and would lose what it meant to save. While they are held Ratatosk makes at most three `security` calls, each limited to 2 s like Claude Code's own. While held they are touched every 2.5 s. A lock is only touched or removed while it is still the same directory Ratatosk created; replacing someone else's would compromise their refresh. Ratatosk writes no `.oauth_refresh.lock.owner` record, which leaves Claude Code nothing to take over while Ratatosk is alive.
+  - A switch first saves the login being left, under the refresh locks only, so no refresh can rotate it meanwhile. Then, under all four, it re-reads the live login and checks it is still the one it saved, writes the stored one and reads it back, then rewrites `~/.claude.json` atomically in Claude Code's own format (two-space indent, key order kept, no final newline, same permissions). If anything fails after the Keychain write started, the previous item is put back. A Claude Code refresh that waited on the locks finds an unexpired credential afterwards and keeps it.
+  - Keychain writes go through `/usr/bin/security -i` on stdin, so tokens never appear in a process list. Stored logins live in the Keychain under the service `Ratatosk pool`, one item per email holding its `claudeAiOauth`; `~/.local/state/ratatosk/pool.json` lists the emails with their `oauthAccount`, which holds no secrets.
+  - Known gap: Claude Code writes a new login to the Keychain and to `~/.claude.json` in two steps. A `/login` inside a session that lands exactly between them while Ratatosk saves the current login would file the new tokens under the old email.
+  - Switching refuses when `CLAUDE_CONFIG_DIR` or `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set, when the login is kept in `~/.claude/.credentials.json` or the config in `~/.claude/.config.json`, when `~/.claude.json` is a symlink, and when the login being left has no email to save it under. An account pinned to an org can't join the pool.
+- Later: show each account's 5-hour and 7-day usage (`/api/oauth/usage`) in the picker, and offer to switch when a session stops on a usage limit.
 
 ## Restarts and upgrades
 

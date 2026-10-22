@@ -6,11 +6,14 @@ mod edit;
 mod git;
 mod handoff;
 mod identity;
+mod keychain;
 mod launch;
+mod lockfile;
 mod names;
 mod open;
 mod picker;
 mod place;
+mod pool;
 mod pr;
 mod recent;
 mod state;
@@ -44,7 +47,15 @@ fn main() -> Result<()> {
     let config = config::Config::load()?;
     let base = config.base_dir()?;
     let accounts = config.accounts()?;
-    let mut app = App::new(base, &config, accounts);
+    let pool = std::env::var_os("HOME").map(|home| {
+        pool::Pool::new(
+            Path::new(&home),
+            pool::Pool::index_path(),
+            keychain::user(),
+            accounts.pinned_emails(),
+        )
+    });
+    let mut app = App::new(base, &config, accounts, pool);
     app.request_prs(Instant::now());
     if std::env::args().nth(1).as_deref() == Some("--list") {
         while app.prs_pending() {
@@ -53,6 +64,7 @@ fn main() -> Result<()> {
         }
         return print_list(app);
     }
+    app.sync_pool();
     let mut terminal = init()?;
     let result = run(&mut terminal, app);
     restore();
@@ -134,6 +146,20 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                             planned.name,
                             app.accounts.get(planned.to).name
                         ),
+                        Err(err) => format!("{err:#}"),
+                    });
+                    app.refresh();
+                }
+                Action::SwitchAccount(email) => {
+                    app.status = Some(match switch_account(&mut app, &email) {
+                        Ok(message) => message,
+                        Err(err) => format!("{err:#}"),
+                    });
+                    app.refresh();
+                }
+                Action::SignIn => {
+                    app.status = Some(match sign_in(terminal, &mut app) {
+                        Ok(message) => message,
                         Err(err) => format!("{err:#}"),
                     });
                     app.refresh();
@@ -244,6 +270,49 @@ fn attach(terminal: &mut DefaultTerminal, account: &Account, id: &str, dir: &Pat
     cmd.args(["attach", id]).current_dir(dir);
     handoff::run(terminal, cmd, || false, keyboard_enhanced())?;
     Ok(())
+}
+
+fn switch_account(app: &mut App, email: &str) -> Result<String> {
+    let pool = app
+        .pool
+        .as_mut()
+        .context("account switching isn't available")?;
+    pool.switch(&keychain::Keychain, email)?;
+    let now = app.accounts.get(account::DEFAULT).signed_in_as()?;
+    ensure!(
+        now.as_deref()
+            .is_some_and(|now| now.eq_ignore_ascii_case(email)),
+        "switched, but Claude Code reports {} as signed in; check `claude auth status`",
+        now.as_deref().unwrap_or("nobody")
+    );
+    Ok(format!(
+        "signed in as {email} · running sessions on the default login follow within 30 s"
+    ))
+}
+
+// Signs in under a throwaway CLAUDE_CONFIG_DIR, so the default login and its refresh token are
+// never touched; the new login is then copied into the pool.
+fn sign_in(terminal: &mut DefaultTerminal, app: &mut App) -> Result<String> {
+    let dir = state::dir().context("HOME is not set")?.join("sign-in");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let mut cmd = std::process::Command::new("claude");
+    cmd.env("CLAUDE_CONFIG_DIR", &dir)
+        .args(["auth", "login"])
+        .current_dir(&app.base);
+    let ran = handoff::run(terminal, cmd, || false, keyboard_enhanced());
+    let imported = app
+        .pool
+        .as_mut()
+        .context("account switching isn't available")
+        .and_then(|pool| pool.import(&keychain::Keychain, &dir));
+    let _ = std::fs::remove_dir_all(&dir);
+    ran?;
+    let member = imported?;
+    Ok(format!(
+        "added {} · enter on it in ctrl+a makes it the default login",
+        member.email
+    ))
 }
 
 // A pinned account must be logged in as itself: starting there must never fall back to another

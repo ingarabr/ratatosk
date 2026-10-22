@@ -76,14 +76,23 @@ impl Account {
     }
 
     pub fn check_login(&self) -> Result<()> {
+        self.verify(&self.auth_status()?)
+    }
+
+    // Who Claude Code says this account is signed in as, if anyone.
+    pub fn signed_in_as(&self) -> Result<Option<String>> {
+        let status = self.auth_status()?;
+        Ok(status.logged_in.then_some(status.email).flatten())
+    }
+
+    fn auth_status(&self) -> Result<AuthStatus> {
         let out = self
             .claude()
             .args(["auth", "status", "--json"])
             .output()
             .context("could not run `claude auth status`")?;
-        let status = serde_json::from_slice(&out.stdout)
-            .context("unexpected output from `claude auth status --json`")?;
-        self.verify(&status)
+        serde_json::from_slice(&out.stdout)
+            .context("unexpected output from `claude auth status --json`")
     }
 
     fn verify(&self, status: &AuthStatus) -> Result<()> {
@@ -188,6 +197,14 @@ impl Accounts {
             });
         }
         Ok(Self { list, aliases })
+    }
+
+    pub fn pinned_emails(&self) -> Vec<String> {
+        self.list
+            .iter()
+            .filter(|a| a.pinned())
+            .filter_map(|a| a.email.clone())
+            .collect()
     }
 
     pub fn get(&self, i: usize) -> &Account {

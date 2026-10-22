@@ -17,7 +17,7 @@ use ratatui::{
 use crate::{
     account,
     agents::State,
-    app::{App, Choice, Focus, Line},
+    app::{AccountPicker, App, Choice, Focus, Line},
     launch::{Draft, Field, Repo, Target},
     picker::{Item, Picker},
     place::{Kind, Place, Scope},
@@ -70,6 +70,60 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(choice) = &app.choosing {
         draw_choice(frame, app, choice);
     }
+    if let Some(picker) = &app.picking_account {
+        draw_accounts(frame, app, picker);
+    }
+}
+
+fn draw_accounts(frame: &mut Frame, app: &App, picker: &AccountPicker) {
+    let Some(pool) = &app.pool else {
+        return;
+    };
+    let active = app.signed_in.as_ref().map(|m| m.email.to_lowercase());
+    let mut lines: Vec<TextLine> = pool
+        .members
+        .iter()
+        .map(|m| {
+            let current = Some(m.email.to_lowercase()) == active;
+            TextLine::from(vec![
+                Span::raw(if current { " ● " } else { "   " }).green(),
+                Span::raw(m.email.clone()),
+                Span::raw(
+                    m.organization
+                        .as_ref()
+                        .map(|o| format!("  {o}"))
+                        .unwrap_or_default(),
+                )
+                .dim(),
+            ])
+        })
+        .collect();
+    lines.push(TextLine::from("   + sign in to another account").cyan());
+    if let Some(line) = lines.get_mut(picker.cursor) {
+        *line = std::mem::take(line).patch_style(Style::new().add_modifier(Modifier::REVERSED));
+    }
+    lines.push(TextLine::default());
+    lines.push(
+        TextLine::from(" enter switches the default login · ctrl+x twice forgets one · esc").dim(),
+    );
+    lines.push(TextLine::from(" pinned orgs keep their own account").dim());
+    let width = lines
+        .iter()
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(20)
+        .max(40)
+        + 4;
+    let area = centered(frame.area(), width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" accounts ".bold())
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        area,
+    );
 }
 
 fn open_with(app: &App, i: usize) -> String {
@@ -206,6 +260,13 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
             state_style(State::Working),
         ),
         Span::raw(format!(" · by {} ", view.view.sort.label())).dim(),
+        Span::raw(
+            view.signed_in
+                .as_ref()
+                .map(|m| format!("· {} ", m.email))
+                .unwrap_or_default(),
+        )
+        .dim(),
     ]);
 
     let rows = view.lines.iter().map(|line| match line {
@@ -641,7 +702,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_empty() {
         [
             "↑↓ to select · enter or → to attach · ←/→ on a group collapses/expands · tab for projects",
-            "ctrl+o to open · ctrl+l to move · ctrl+r to rename · ctrl+s to sort · ctrl+x to stop, twice to delete · esc to quit",
+            "ctrl+a for accounts · ctrl+o to open · ctrl+l to move · ctrl+r to rename · ctrl+s to sort · ctrl+x to stop, twice to delete · esc to quit",
         ]
     } else {
         [
@@ -728,13 +789,24 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
         Span::raw("  starts in ").dim(),
         Span::raw(starts_in),
     ]));
-    if let Some(l) = &launch
-        && l.account != account::DEFAULT
-    {
+    if let Some(l) = &launch {
+        let (name, why) = if l.account != account::DEFAULT {
+            (
+                app.accounts.get(l.account).name.clone(),
+                "  (pinned for this org in the config)",
+            )
+        } else {
+            (
+                app.signed_in
+                    .as_ref()
+                    .map_or_else(|| "default login".to_string(), |m| m.email.clone()),
+                "  (the default login · ctrl+a in the list switches it)",
+            )
+        };
         lines.push(TextLine::from(vec![
             Span::raw("  account   ").dim(),
-            Span::raw(app.accounts.get(l.account).name.clone()),
-            Span::raw("  (pinned for this org in the config)").dim(),
+            Span::raw(name),
+            Span::raw(why).dim(),
         ]));
     }
     let command = launch
