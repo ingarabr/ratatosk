@@ -15,6 +15,7 @@ use ratatui::{
 };
 
 use crate::{
+    account,
     agents::State,
     app::{App, Choice, Focus, Line},
     launch::{Draft, Field, Repo, Target},
@@ -247,6 +248,12 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
                         ),
                         _ => Span::raw(session.name.as_str()),
                     },
+                    match view.misplaced(*i) {
+                        Some(want) => {
+                            Span::raw(format!("  ⚠ not on {}", view.accounts.get(want).name)).red()
+                        }
+                        None => Span::raw(""),
+                    },
                 ])),
                 Cell::from(if view.places[*i].worktree().is_some() {
                     WORKTREE
@@ -328,6 +335,12 @@ fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
                 "· in its own terminal "
             } else {
                 ""
+            })
+            .dim(),
+            Span::raw(if session.account == account::DEFAULT {
+                String::new()
+            } else {
+                format!("· {} account ", app.accounts.get(session.account).name)
             })
             .dim(),
         ]))
@@ -628,7 +641,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.input.is_empty() {
         [
             "↑↓ to select · enter or → to attach · ←/→ on a group collapses/expands · tab for projects",
-            "ctrl+o to open · ctrl+r to rename · ctrl+s to sort · ctrl+x to stop, twice to delete · esc to quit",
+            "ctrl+o to open · ctrl+l to move · ctrl+r to rename · ctrl+s to sort · ctrl+x to stop, twice to delete · esc to quit",
         ]
     } else {
         [
@@ -648,7 +661,7 @@ const DRAFT_WIDTH: u16 = 100;
 fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
     let repos = &app.repos;
     let target = draft.target.as_ref();
-    let launch = draft.launch(&app.base, repos);
+    let launch = draft.launch(&app.base, repos, &app.accounts);
     let picking = draft.field == Field::Project;
 
     let field = |which: Field, label: &str, value: Option<String>| {
@@ -715,8 +728,24 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
         Span::raw("  starts in ").dim(),
         Span::raw(starts_in),
     ]));
+    if let Some(l) = &launch
+        && l.account != account::DEFAULT
+    {
+        lines.push(TextLine::from(vec![
+            Span::raw("  account   ").dim(),
+            Span::raw(app.accounts.get(l.account).name.clone()),
+            Span::raw("  (pinned for this org in the config)").dim(),
+        ]));
+    }
     let command = launch
-        .map(|l| format!("claude {}", shell_words(&l.args())))
+        .as_ref()
+        .map(|l| {
+            format!(
+                "{}claude {}",
+                app.accounts.get(l.account).env_prefix(),
+                shell_words(&l.args())
+            )
+        })
         .unwrap_or_default();
     lines.extend(labelled(
         "  runs      ",
@@ -983,6 +1012,9 @@ mod tests {
                 detail: Some("awaiting go-ahead to push".into()),
                 prs: Vec::new(),
                 interactive: false,
+                account: 0,
+                session_id: None,
+                running: false,
             }],
             places: vec![crate::place::repo(
                 "acme",
@@ -1242,6 +1274,9 @@ mod menu_tests {
             detail: None,
             prs: Vec::new(),
             interactive: false,
+            account: 0,
+            session_id: None,
+            running: false,
         }
     }
 

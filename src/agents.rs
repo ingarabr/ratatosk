@@ -1,7 +1,13 @@
-use std::{collections::HashMap, fs, path::PathBuf, process::Command};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+
+use crate::account::Account;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -44,6 +50,10 @@ pub struct Session {
     // A plain `claude` in a terminal of its own: listed, but `claude attach`, `stop` and `rm`
     // only work on background sessions.
     pub interactive: bool,
+    // Index into the configured accounts; attach, stop and rm must go to the same one.
+    pub account: usize,
+    pub session_id: Option<String>,
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +87,7 @@ struct AgentRow {
     state: Option<String>,
     session_id: Option<String>,
     started_at: Option<u64>,
+    pid: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -86,8 +97,9 @@ struct LiveSession {
     cwd: PathBuf,
 }
 
-pub fn load() -> Result<Vec<Session>> {
-    let out = Command::new("claude")
+pub fn load(account: &Account, index: usize) -> Result<Vec<Session>> {
+    let out = account
+        .claude()
         .args(["agents", "--json", "--all"])
         .output()
         .context("could not run `claude agents --json --all`")?;
@@ -102,7 +114,7 @@ pub fn load() -> Result<Vec<Session>> {
         .into_iter()
         .filter_map(|value| serde_json::from_value::<AgentRow>(value).ok());
     // `claude agents` reports where a session started; its session file has where it is now (e.g. after EnterWorktree).
-    let live = live_cwds();
+    let live = live_cwds(account.state_dir());
     Ok(rows
         .filter_map(|row| {
             let id = row.id.clone().or_else(|| {
@@ -110,7 +122,7 @@ pub fn load() -> Result<Vec<Session>> {
                     .as_deref()
                     .map(|s| s.chars().take(8).collect())
             })?;
-            let job = job_state(&id);
+            let job = job_state(account.state_dir(), &id);
             let state = match (row.state.as_deref(), row.status.as_deref()) {
                 (Some(state), _) => State::parse(Some(state)),
                 (None, Some("busy")) => State::Working,
@@ -142,6 +154,9 @@ pub fn load() -> Result<Vec<Session>> {
                     .unwrap_or_default(),
                 id,
                 state,
+                account: index,
+                session_id: row.session_id,
+                running: row.pid.is_some(),
                 started_at_ms: row.started_at,
                 active_at_ms: job
                     .as_ref()
@@ -171,15 +186,8 @@ struct JobChild {
 // The agents view's own record of a session: its one-line status (`detail`) and the PRs it
 // found in the transcript (`children`). The file is undocumented, so a read or parse failure
 // just leaves both out.
-fn job_state(id: &str) -> Option<JobState> {
-    let home = std::env::var_os("HOME")?;
-    let bytes = fs::read(
-        PathBuf::from(home)
-            .join(".claude/jobs")
-            .join(id)
-            .join("state.json"),
-    )
-    .ok()?;
+fn job_state(state_dir: &Path, id: &str) -> Option<JobState> {
+    let bytes = fs::read(state_dir.join("jobs").join(id).join("state.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -201,16 +209,17 @@ fn iso_ms(text: &str) -> Option<u64> {
     u64::try_from(((days * 24 + h) * 60 + min) * 60_000 + sec * 1000 + millis).ok()
 }
 
-pub fn stop(id: &str) -> Result<String> {
-    run(&["stop", id])
+pub fn stop(account: &Account, id: &str) -> Result<String> {
+    run(account, &["stop", id])
 }
 
-pub fn remove(id: &str) -> Result<String> {
-    run(&["rm", id])
+pub fn remove(account: &Account, id: &str) -> Result<String> {
+    run(account, &["rm", id])
 }
 
-fn run(args: &[&str]) -> Result<String> {
-    let out = Command::new("claude")
+fn run(account: &Account, args: &[&str]) -> Result<String> {
+    let out = account
+        .claude()
         .args(args)
         .output()
         .with_context(|| format!("could not run `claude {}`", args.join(" ")))?;
@@ -224,11 +233,8 @@ fn run(args: &[&str]) -> Result<String> {
     Ok(text(&out.stdout))
 }
 
-fn live_cwds() -> HashMap<String, PathBuf> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return HashMap::new();
-    };
-    let Ok(entries) = fs::read_dir(PathBuf::from(home).join(".claude/sessions")) else {
+fn live_cwds(state_dir: &Path) -> HashMap<String, PathBuf> {
+    let Ok(entries) = fs::read_dir(state_dir.join("sessions")) else {
         return HashMap::new();
     };
     entries

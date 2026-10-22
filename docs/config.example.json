@@ -1,4 +1,13 @@
 {
+  "accounts": {
+    "acme": {
+      "configDir": "~/.claude-acme",
+      "email": "me@acme.example",
+      "orgs": [
+        "acme"
+      ]
+    }
+  },
   "baseDir": "~/projects",
   "manualModel": {
     "orgs": [

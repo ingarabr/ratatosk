@@ -11,6 +11,7 @@ use ratatui::{
 };
 
 use crate::{
+    account::{self, Accounts},
     agents::{self, Session, State},
     config::{Config, ManualModel},
     edit, git,
@@ -43,12 +44,43 @@ pub enum Line {
 pub enum Action {
     None,
     Quit,
-    Attach { id: String, cwd: PathBuf },
-    Start { launch: Launch, open: bool },
-    Trust { launch: Launch, open: bool },
-    Stop { id: String },
-    Open { opener: usize, dir: PathBuf },
-    Delete { id: String },
+    Attach {
+        id: String,
+        cwd: PathBuf,
+        account: usize,
+    },
+    Start {
+        launch: Launch,
+        open: bool,
+    },
+    Trust {
+        launch: Launch,
+        open: bool,
+    },
+    Stop {
+        id: String,
+        account: usize,
+    },
+    Open {
+        opener: usize,
+        dir: PathBuf,
+    },
+    Delete {
+        id: String,
+        account: usize,
+    },
+    Move(Move),
+}
+
+// A session that runs on the wrong account, to be resumed on the one its org is pinned to.
+pub struct Move {
+    pub id: String,
+    pub name: String,
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub running: bool,
+    pub from: usize,
+    pub to: usize,
 }
 
 #[derive(Default)]
@@ -84,6 +116,7 @@ pub struct App {
     pub fitting: Vec<Vec<usize>>,
     pub choosing: Option<Choice>,
     pub resolver: Resolver,
+    pub accounts: Accounts,
 }
 
 pub struct Choice {
@@ -93,7 +126,7 @@ pub struct Choice {
 }
 
 impl App {
-    pub fn new(base: PathBuf, config: &Config) -> Self {
+    pub fn new(base: PathBuf, config: &Config, accounts: Accounts) -> Self {
         let mut resolver = Resolver::new(config.org_aliases.clone());
         let mut app = Self {
             repos: launch::discover(&base, &mut resolver),
@@ -129,6 +162,7 @@ impl App {
             fitting: Vec::new(),
             choosing: None,
             resolver,
+            accounts,
         };
         app.refresh();
         app
@@ -136,20 +170,27 @@ impl App {
 
     pub fn refresh(&mut self) {
         let keep = self.selected_session().map(|s| s.id.clone());
-        match agents::load() {
-            Ok(mut sessions) => {
-                self.claude_names.clear();
-                for session in &mut sessions {
-                    if let Some(name) = self.names.get(&session.id) {
-                        let claude = std::mem::replace(&mut session.name, name.clone());
-                        self.claude_names.insert(session.id.clone(), claude);
-                    }
-                }
-                self.sessions = sessions;
-                self.error = None;
+        let accounts = self.accounts.distinct();
+        let mut sessions = Vec::new();
+        let mut errors = Vec::new();
+        for &i in &accounts {
+            match agents::load(self.accounts.get(i), i) {
+                Ok(found) => sessions.extend(found),
+                Err(err) if i == account::DEFAULT => errors.push(format!("{err:#}")),
+                Err(err) => errors.push(format!("{} account: {err:#}", self.accounts.get(i).name)),
             }
-            Err(err) => self.error = Some(format!("{err:#}")),
         }
+        if errors.len() < accounts.len() {
+            self.claude_names.clear();
+            for session in &mut sessions {
+                if let Some(name) = self.names.get(&session.id) {
+                    let claude = std::mem::replace(&mut session.name, name.clone());
+                    self.claude_names.insert(session.id.clone(), claude);
+                }
+            }
+            self.sessions = sessions;
+        }
+        self.error = (!errors.is_empty()).then(|| errors.join(" · "));
         self.rebuild(keep.as_deref());
     }
 
@@ -214,6 +255,7 @@ impl App {
             KeyCode::Char('c') if ctrl => return Action::Quit,
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
             KeyCode::Char('o') if ctrl => return self.open_selected(),
+            KeyCode::Char('l') if ctrl => return self.move_selected(),
             KeyCode::Char('s') if ctrl => {
                 self.view.sort = self.view.sort.next();
                 self.save_view();
@@ -273,11 +315,11 @@ impl App {
     fn on_draft_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-        let (base, repos) = (&self.base, &self.repos);
+        let (base, repos, accounts) = (&self.base, &self.repos, &self.accounts);
         let Some(draft) = self.draft.as_mut() else {
             return Action::None;
         };
-        let start = |draft: &mut Draft, open: bool| match draft.launch(base, repos) {
+        let start = |draft: &mut Draft, open: bool| match draft.launch(base, repos, accounts) {
             Some(launch) if draft.needs_trust => Action::Trust { launch, open },
             Some(launch) => Action::Start { launch, open },
             None => {
@@ -488,7 +530,7 @@ impl App {
         if self.interactive_selected() {
             return Action::None;
         }
-        let Some(id) = self.selected_session().map(|s| s.id.clone()) else {
+        let Some((id, account)) = self.selected_session().map(|s| (s.id.clone(), s.account)) else {
             return Action::None;
         };
         let armed = self
@@ -496,10 +538,66 @@ impl App {
             .take()
             .is_some_and(|(armed, at)| armed == id && now.duration_since(at) <= DELETE_WINDOW);
         if armed {
-            return Action::Delete { id };
+            return Action::Delete { id, account };
         }
         self.armed_delete = Some((id.clone(), now));
-        Action::Stop { id }
+        Action::Stop { id, account }
+    }
+
+    pub fn org_of(&self, i: usize) -> Option<&str> {
+        match &self.places[i] {
+            Place::Repo { org, .. } => Some(org),
+            _ => None,
+        }
+    }
+
+    // The pinned account a session should run on instead of its own, if any.
+    pub fn misplaced(&self, i: usize) -> Option<usize> {
+        self.accounts
+            .misplaced(self.sessions[i].account, self.org_of(i))
+    }
+
+    fn move_selected(&mut self) -> Action {
+        if self.interactive_selected() {
+            return Action::None;
+        }
+        let Some(i) = self.selected_session_index() else {
+            return Action::None;
+        };
+        let session = &self.sessions[i];
+        let Some(to) = self.misplaced(i) else {
+            self.status = Some(format!(
+                "{} already runs on the account its project uses",
+                session.name
+            ));
+            return Action::None;
+        };
+        let Some(session_id) = session.session_id.clone() else {
+            self.status = Some(format!("{} has no session id to resume", session.name));
+            return Action::None;
+        };
+        Action::Move(Move {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            session_id,
+            cwd: session.cwd.clone(),
+            running: session.running,
+            from: session.account,
+            to,
+        })
+    }
+
+    // Keeps Ratatosk's name for a session that came back under a new id.
+    pub fn carry_name(&mut self, from: &str, to: &str) {
+        let Some(name) = self.names.remove(from) else {
+            return;
+        };
+        self.names.insert(to.to_string(), name);
+        if let Some(path) = &self.names_path
+            && let Err(err) = names::save(path, &self.names)
+        {
+            self.error = Some(format!("could not save names: {err}"));
+        }
     }
 
     fn interactive_selected(&mut self) -> bool {
@@ -524,6 +622,7 @@ impl App {
             .map_or(Action::None, |s| Action::Attach {
                 id: s.id.clone(),
                 cwd: s.cwd.clone(),
+                account: s.account,
             })
     }
 
@@ -863,6 +962,43 @@ impl App {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ctrl_l_moves_a_pinned_org_session_off_the_wrong_account() {
+        let mut app = app_with(&["a", "b", "c"]);
+        app.places = vec![
+            crate::place::repo("acme", "billing", None),
+            crate::place::repo("acme", "billing", None),
+            crate::place::repo("globex", "engine", None),
+        ];
+        app.accounts = Accounts::new(
+            &std::collections::BTreeMap::from([(
+                "acme".to_string(),
+                serde_json::from_str(r#"{ "configDir": "/h/.claude-acme", "orgs": ["acme"] }"#)
+                    .unwrap(),
+            )]),
+            HashMap::new(),
+            None,
+            std::path::Path::new("/h"),
+        )
+        .unwrap();
+        app.sessions[0].session_id = Some("a-full-id".into());
+        app.sessions[0].running = true;
+        app.sessions[1].account = 1;
+        assert_eq!(app.misplaced(0), Some(1));
+        assert_eq!(app.misplaced(1), None);
+        assert_eq!(app.misplaced(2), None, "unpinned orgs may run anywhere");
+
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(matches!(
+            app.on_key(ctrl_l),
+            Action::Move(Move { ref session_id, running: true, from: 0, to: 1, .. })
+                if session_id == "a-full-id"
+        ));
+        app.table.select(Some(1));
+        assert!(matches!(app.on_key(ctrl_l), Action::None));
+        assert!(app.status.unwrap().contains("already runs on"));
+    }
+
     fn app_with(ids: &[&str]) -> App {
         let sessions: Vec<Session> = ids
             .iter()
@@ -876,6 +1012,9 @@ mod tests {
                 detail: None,
                 prs: Vec::new(),
                 interactive: false,
+                account: 0,
+                session_id: None,
+                running: false,
             })
             .collect();
         App {
@@ -904,9 +1043,9 @@ mod tests {
     fn ctrl_x_stops_and_a_second_press_soon_after_deletes() {
         let mut app = app_with(&["a", "b"]);
         let t0 = Instant::now();
-        assert!(matches!(app.stop_or_delete(t0), Action::Stop { id } if id == "a"));
+        assert!(matches!(app.stop_or_delete(t0), Action::Stop { id, .. } if id == "a"));
         assert!(
-            matches!(app.stop_or_delete(t0 + Duration::from_secs(1)), Action::Delete { id } if id == "a")
+            matches!(app.stop_or_delete(t0 + Duration::from_secs(1)), Action::Delete { id, .. } if id == "a")
         );
         assert!(matches!(
             app.stop_or_delete(t0 + Duration::from_secs(2)),
@@ -925,7 +1064,7 @@ mod tests {
         ));
         app.table.select(Some(1));
         assert!(
-            matches!(app.stop_or_delete(t0 + Duration::from_secs(3)), Action::Stop { id } if id == "b")
+            matches!(app.stop_or_delete(t0 + Duration::from_secs(3)), Action::Stop { id, .. } if id == "b")
         );
     }
 }
@@ -973,6 +1112,9 @@ mod scope_tests {
                 detail: None,
                 prs: Vec::new(),
                 interactive: false,
+                account: 0,
+                session_id: None,
+                running: false,
             });
         }
         app.rebuild(None);
@@ -1015,6 +1157,9 @@ mod rename_tests {
             detail: None,
             prs: Vec::new(),
             interactive: false,
+            account: 0,
+            session_id: None,
+            running: false,
         });
         app.rebuild(None);
         app
@@ -1104,6 +1249,9 @@ mod pr_tests {
             detail: None,
             prs: Vec::new(),
             interactive: false,
+            account: 0,
+            session_id: None,
+            running: false,
         });
         app.places = vec![Place::of(&app.base, &app.sessions[0].cwd)];
         app.branches = vec![Some("refunds".into())];
@@ -1202,6 +1350,9 @@ mod draft_scope_tests {
             detail: None,
             prs: Vec::new(),
             interactive: false,
+            account: 0,
+            session_id: None,
+            running: false,
         });
         app.rebuild(None);
         app.scope = scope;
@@ -1262,6 +1413,9 @@ mod collapse_tests {
                 detail: None,
                 prs: Vec::new(),
                 interactive: false,
+                account: 0,
+                session_id: None,
+                running: false,
             });
         }
         app.rebuild(None);
@@ -1419,6 +1573,9 @@ mod open_tests {
             detail: None,
             prs: Vec::new(),
             interactive: false,
+            account: 0,
+            session_id: None,
+            running: false,
         });
         app.rebuild(None);
         app.fitting = vec![fitting];
@@ -1492,6 +1649,9 @@ mod sort_tests {
                 detail: None,
                 prs: Vec::new(),
                 interactive: false,
+                account: 0,
+                session_id: None,
+                running: false,
             });
         }
         app.rebuild(None);
@@ -1584,6 +1744,9 @@ mod interactive_tests {
             detail: None,
             prs: Vec::new(),
             interactive: true,
+            account: 0,
+            session_id: None,
+            running: false,
         });
         app.rebuild(None);
         assert!(matches!(

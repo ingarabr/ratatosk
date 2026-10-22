@@ -2,12 +2,12 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{Context, Result, ensure};
 
 use crate::{
+    account::{Account, Accounts},
     config::ManualModel,
     identity::{Resolver, clone_score},
     picker::{Item, Picker},
@@ -301,9 +301,10 @@ impl Draft {
         }
     }
 
-    pub fn launch(&self, base: &Path, repos: &[Repo]) -> Option<Launch> {
+    pub fn launch(&self, base: &Path, repos: &[Repo], accounts: &Accounts) -> Option<Launch> {
         let target = self.target.as_ref()?;
         Some(Launch {
+            account: accounts.for_org(Some(target.org(repos))),
             dir: target.dir(base, repos),
             create: matches!(target, Target::New { .. }),
             label: target.key(repos),
@@ -322,6 +323,7 @@ fn step_index(len: usize, at: Option<usize>, step: isize) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
+    pub account: usize,
     pub dir: PathBuf,
     pub create: bool,
     pub label: String,
@@ -343,12 +345,13 @@ impl Launch {
         args
     }
 
-    pub fn start(&self) -> Result<String> {
+    pub fn start(&self, account: &Account) -> Result<String> {
         if self.create {
             fs::create_dir_all(&self.dir)
                 .with_context(|| format!("could not create {}", self.dir.display()))?;
         }
-        let out = Command::new("claude")
+        let out = account
+            .claude()
             .args(self.args())
             .current_dir(&self.dir)
             .output()
@@ -476,7 +479,9 @@ mod tests {
             &repos,
             acme(),
         );
-        let launch = draft.launch(Path::new("/p"), &repos).unwrap();
+        let launch = draft
+            .launch(Path::new("/p"), &repos, &Accounts::default())
+            .unwrap();
         assert_eq!(launch.dir, PathBuf::from("/p/ingarabr/tool"));
         assert!(launch.create);
         assert_eq!(launch.label, "ingarabr/tool");
@@ -485,6 +490,7 @@ mod tests {
     #[test]
     fn args_skip_defaults_and_protect_a_dash_prompt() {
         let launch = Launch {
+            account: 0,
             dir: PathBuf::from("/p"),
             create: false,
             label: "ingarabr/ratatosk".into(),

@@ -2,6 +2,8 @@ use std::{fs, path::Path};
 
 use serde::Deserialize;
 
+use crate::account::Account;
+
 #[derive(Deserialize)]
 struct ClaudeConfig {
     #[serde(default)]
@@ -15,10 +17,10 @@ struct ProjectConfig {
 }
 
 // Whether Claude Code's trust prompt was accepted for exactly this folder; `claude --bg`
-// refuses to start in one that wasn't. None when ~/.claude.json can't be read.
-pub fn is_trusted(dir: &Path) -> Option<bool> {
-    let home = std::env::var_os("HOME")?;
-    let bytes = fs::read(Path::new(&home).join(".claude.json")).ok()?;
+// refuses to start in one that wasn't. Each account keeps its own answers. None when the
+// account's .claude.json can't be read.
+pub fn is_trusted(account: &Account, dir: &Path) -> Option<bool> {
+    let bytes = fs::read(account.global_config()).ok()?;
     Some(trusted_in(&bytes, dir))
 }
 

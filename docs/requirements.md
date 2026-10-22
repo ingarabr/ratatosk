@@ -67,7 +67,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
     - `^O` opens the session's folder (worktree or repo root) with a tool from the config's `openers`. Tools can be limited to folders with certain files at the top (`Cargo.toml`, `pom.xml`, `bleep.yaml`); one fitting tool opens directly, several open a chooser. The details band shows which tools fit.
     - `^P` checks out a PR for review.
     - `^B` starts a rebase session.
-    - `^L` moves a session to its repo.
+    - `^L` moves a session to its repo, and to the account its org is pinned to.
     - `^W` opens the PR on GitHub.
     - `^D` prunes merged worktrees.
   - Line editing is the same in every text field (the prompt, the rename box, the project filter). Option+⌫ (or Ctrl+⌫) deletes the last word; Cmd+⌫ and `^U` clear the field. `^W` is not a word delete here, since it opens the PR. Ghostty sends Cmd+⌫ as `^U` by default, so both are handled. The fields have no cursor, so there is no `^A`/`^E`/`^K`.
@@ -120,6 +120,20 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   - uncommitted changes.
 - Never delete a worktree with uncommitted changes without an explicit confirm.
 - Pruning lists what will be removed, with reasons, before doing anything.
+
+## Accounts
+
+- An org can be pinned to a Claude Code account in the config (`accounts`). Repos of a pinned org always use that account, never the default one. Claude Code has no account switch, so an account is a `CLAUDE_CONFIG_DIR` of its own: its own Keychain login, daemon, session list, transcripts, auto-memory and folder trust (`.claude.json` moves into the directory too).
+- Every `claude` command for a pinned org runs with that account's `CLAUDE_CONFIG_DIR`: start, the trust step, attach, stop and delete. The default account leaves the variable as Ratatosk got it, since Claude Code keys the Keychain entry by the variable's literal value, and naming `~/.claude` explicitly looks logged out.
+- Before starting on a pinned account, `claude auth status --json` must show it logged in, and as the configured `email` when one is set. Otherwise the confirmation shows the `claude auth login` command to run, and nothing starts.
+- The list runs `claude agents --json --all` once per account and merges the results; each session remembers its account. The confirmation shows the account and the full command with `CLAUDE_CONFIG_DIR`, and the details band names a non-default account.
+- A session of a pinned org running on another account is marked "⚠ not on <account>". `^L` moves it:
+  1. it stops the session if it is running;
+  2. it copies the transcript (and the subagents' folder) into the pinned account's `projects/`, plus the repo's auto-memory when the account has none for that folder yet;
+  3. it resumes it there with `claude --bg --resume <session-id>` from the same folder, after the trust step if needed;
+  4. only then does it remove the old one.
+  Ratatosk's own name for the session carries over.
+- Later: repos with no pinned account could rotate between several logins, as claude-swap does. Pinned orgs must stay out of that.
 
 ## Restarts and upgrades
 

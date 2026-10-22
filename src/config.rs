@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
 };
@@ -7,11 +7,15 @@ use std::{
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::open::Opener;
+use crate::{
+    account::{AccountConfig, Accounts},
+    open::Opener,
+};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
+    pub accounts: BTreeMap<String, AccountConfig>,
     pub base_dir: Option<String>,
     pub manual_model: ManualModel,
     pub openers: Option<Vec<Opener>>,
@@ -68,6 +72,15 @@ impl Config {
         self.openers.clone().unwrap_or_else(Opener::defaults)
     }
 
+    pub fn accounts(&self) -> Result<Accounts> {
+        Accounts::new(
+            &self.accounts,
+            self.org_aliases.clone(),
+            std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+            &home()?,
+        )
+    }
+
     pub fn base_dir(&self) -> Result<PathBuf> {
         if let Some(dir) = std::env::var_os("RATATOSK_BASE_DIR") {
             return Ok(dir.into());
@@ -96,7 +109,7 @@ fn home() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-fn expand(dir: &str, home: &Path) -> PathBuf {
+pub fn expand(dir: &str, home: &Path) -> PathBuf {
     match dir.strip_prefix("~/") {
         Some(rest) => home.join(rest),
         None if dir == "~" => home.to_path_buf(),
@@ -112,6 +125,7 @@ mod tests {
     fn parses_base_dir_and_manual_model_from_json() {
         let config: Config = serde_json::from_str(
             r#"{
+                "accounts": { "acme": { "configDir": "~/.claude-acme", "email": "me@acme.example", "orgs": ["acme"] } },
                 "baseDir": "~/code",
                 "manualModel": { "orgs": ["acme"], "promptWords": ["acme"] },
                 "openers": [{ "name": "RustRover", "command": ["rustrover", "{dir}"], "when": ["Cargo.toml"] }],
@@ -120,6 +134,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.base_dir.as_deref(), Some("~/code"));
+        assert_eq!(config.accounts["acme"].orgs, ["acme"]);
         assert_eq!(config.manual_model.orgs, ["acme"]);
         assert_eq!(config.openers()[0].when, ["Cargo.toml"]);
         assert_eq!(config.manual_model().aliases["acme-folder"], "acme");
