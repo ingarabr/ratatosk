@@ -118,9 +118,20 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => match app.on_key(key) {
                 Action::Quit => return Ok(()),
-                Action::Attach { id, cwd, account } => {
-                    let dir = if cwd.is_dir() { cwd } else { app.base.clone() };
-                    attach(terminal, app.accounts.get(account), &id, &dir)?;
+                Action::Attach { id, dir, account } => {
+                    let account = app.accounts.get(account).clone();
+                    if trust::is_trusted(&account, &dir) == Some(false) {
+                        run_claude_in(terminal, &account, &dir)?;
+                    }
+                    if trust::is_trusted(&account, &dir) == Some(false) {
+                        app.status = Some(format!(
+                            "the {} account doesn't trust {} yet, so the session can't open there",
+                            account.name,
+                            place::tilde(&dir)
+                        ));
+                        continue;
+                    }
+                    attach(terminal, &account, &id, &dir)?;
                     app.refresh();
                     app.request_prs(Instant::now());
                 }
@@ -354,7 +365,11 @@ fn move_session(terminal: &mut DefaultTerminal, app: &mut App, planned: &Move) -
         to.name,
         String::from_utf8_lossy(&out.stderr).trim()
     );
-    agents::remove(&from, &planned.id)?;
+    // `claude rm` also deletes a worktree Claude created for the session, which the resumed
+    // session still runs in. Such an old entry is left stopped; Ratatosk hides it.
+    if !planned.in_worktree {
+        agents::remove(&from, &planned.id)?;
+    }
     app.refresh();
     if let Some(new) = app
         .sessions

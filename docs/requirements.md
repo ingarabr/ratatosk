@@ -132,8 +132,9 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   1. it stops the session if it is running;
   2. it copies the transcript (and the subagents' folder) into the pinned account's `projects/`, plus the repo's auto-memory when the account has none for that folder yet;
   3. it resumes it there with `claude --bg --resume <session-id>` from the same folder, after the trust step if needed;
-  4. only then does it remove the old one.
+  4. only then does it remove the old one, except for a session in a worktree: `claude rm` also deletes the worktree Claude created for the session, which the resumed session still runs in. That old entry stays stopped on the account it left, and Ratatosk hides it while the same session runs on a pinned account. Deleting it from the agents view would still delete the worktree.
   Ratatosk's own name for the session carries over.
+- Folder trust is per account. Attaching to a session on an account that hasn't accepted the folder's trust prompt opens Claude there first to answer it, as starting a session does. When the session's folder is gone, attach runs from the repo root instead.
 - Every other repo uses the default login (`~/.claude`), and that login can be switched between several accounts: the pool. Ctrl+A opens it.
   - Enter on an account switches the default login to it. All running sessions on the default login follow within about 30 s, since Claude Code caches its Keychain read for 30 s and re-reads it on a 401; nothing needs a restart. Sessions of pinned orgs are untouched.
   - The current login joins the pool by itself. "Sign in to another account" runs `claude auth login` under a throwaway `CLAUDE_CONFIG_DIR` and copies the result into the pool, so the default login is never touched while you sign in. Never `/logout`: it revokes the refresh token.

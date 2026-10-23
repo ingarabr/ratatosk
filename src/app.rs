@@ -46,9 +46,10 @@ pub enum Line {
 pub enum Action {
     None,
     Quit,
+    // `dir` is where `claude attach` runs: the session's folder, or the nearest one that exists.
     Attach {
         id: String,
-        cwd: PathBuf,
+        dir: PathBuf,
         account: usize,
     },
     Start {
@@ -83,6 +84,7 @@ pub struct Move {
     pub session_id: String,
     pub cwd: PathBuf,
     pub running: bool,
+    pub in_worktree: bool,
     pub from: usize,
     pub to: usize,
 }
@@ -197,6 +199,7 @@ impl App {
             }
         }
         if errors.len() < accounts.len() {
+            hide_moved(&mut sessions);
             self.claude_names.clear();
             for session in &mut sessions {
                 if let Some(name) = self.names.get(&session.id) {
@@ -603,6 +606,7 @@ impl App {
             session_id,
             cwd: session.cwd.clone(),
             running: session.running,
+            in_worktree: self.places[i].worktree().is_some(),
             from: session.account,
             to,
         })
@@ -707,12 +711,20 @@ impl App {
         if self.interactive_selected() {
             return Action::None;
         }
-        self.selected_session()
-            .map_or(Action::None, |s| Action::Attach {
-                id: s.id.clone(),
-                cwd: s.cwd.clone(),
-                account: s.account,
-            })
+        let Some(i) = self.selected_session_index() else {
+            return Action::None;
+        };
+        let session = &self.sessions[i];
+        let dir = [Some(session.cwd.clone()), self.repo_dir(i)]
+            .into_iter()
+            .flatten()
+            .find(|dir| dir.is_dir())
+            .unwrap_or_else(|| self.base.clone());
+        Action::Attach {
+            id: session.id.clone(),
+            dir,
+            account: session.account,
+        }
     }
 
     pub fn selected_session_index(&self) -> Option<usize> {
@@ -1047,6 +1059,19 @@ impl App {
     }
 }
 
+// A session moved to a pinned account from a worktree keeps a stopped entry on the account it
+// left, since removing that would delete the worktree; only the copy on the pinned account shows.
+fn hide_moved(sessions: &mut Vec<Session>) {
+    let moved: Vec<String> = sessions
+        .iter()
+        .filter(|s| s.account != account::DEFAULT)
+        .filter_map(|s| s.session_id.clone())
+        .collect();
+    sessions.retain(|s| {
+        s.account != account::DEFAULT || s.session_id.as_ref().is_none_or(|id| !moved.contains(id))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,6 +1156,18 @@ mod tests {
         app.on_key(key(KeyCode::Down));
         app.on_key(key(KeyCode::Down));
         assert!(matches!(app.on_key(key(KeyCode::Enter)), Action::SignIn));
+    }
+
+    #[test]
+    fn a_session_moved_to_a_pinned_account_shows_once() {
+        let mut sessions = app_with(&["old", "new", "other"]).sessions;
+        sessions[0].session_id = Some("s1".into());
+        sessions[1].session_id = Some("s1".into());
+        sessions[1].account = 1;
+        sessions[2].session_id = Some("s2".into());
+        hide_moved(&mut sessions);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["new", "other"]);
     }
 
     fn app_with(ids: &[&str]) -> App {
