@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use ratatui::crossterm::event::KeyEvent;
 
-use crate::{edit, launch::Repo};
+use crate::{edit::TextField, launch::Repo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
@@ -27,7 +27,7 @@ impl Item {
 }
 
 pub struct Picker {
-    pub filter: String,
+    pub filter: TextField,
     pub cursor: usize,
     open: BTreeSet<String>,
     recent: Vec<usize>,
@@ -36,7 +36,7 @@ pub struct Picker {
 impl Picker {
     pub fn new(recent: Vec<usize>, repos: &[Repo]) -> Self {
         let mut picker = Self {
-            filter: String::new(),
+            filter: TextField::default(),
             cursor: 0,
             open: BTreeSet::new(),
             recent,
@@ -46,12 +46,12 @@ impl Picker {
     }
 
     pub fn filtering(&self) -> bool {
-        !self.filter.trim().is_empty()
+        !self.filter.text().trim().is_empty()
     }
 
     pub fn items(&self, repos: &[Repo]) -> Vec<Item> {
         if self.filtering() {
-            let filter = self.filter.trim().to_lowercase();
+            let filter = self.filter.text().trim().to_lowercase();
             let mut items: Vec<Item> = repos
                 .iter()
                 .enumerate()
@@ -86,7 +86,7 @@ impl Picker {
     }
 
     fn create_options(&self, repos: &[Repo]) -> Vec<Item> {
-        let filter = self.filter.trim();
+        let filter = self.filter.text().trim();
         let folder_orgs: BTreeSet<String> = repos.iter().map(|r| r.folder_org.clone()).collect();
         let (orgs, name): (Vec<String>, &str) = match filter.split_once('/') {
             Some((org, name)) => (folder_orgs.into_iter().filter(|o| o == org).collect(), name),
@@ -165,9 +165,14 @@ impl Picker {
     }
 
     pub fn edit(&mut self, repos: &[Repo], key: KeyEvent) {
-        if edit::apply(&mut self.filter, key) {
+        if self.filter.apply(key) {
             self.reset_cursor(repos);
         }
+    }
+
+    pub fn paste(&mut self, repos: &[Repo], text: &str) {
+        self.filter.paste_line(text);
+        self.reset_cursor(repos);
     }
 
     #[cfg(test)]
@@ -179,7 +184,7 @@ impl Picker {
     }
 
     pub fn set_filter(&mut self, repos: &[Repo], filter: String) {
-        self.filter = filter;
+        self.filter = TextField::new(&filter);
         self.reset_cursor(repos);
     }
 }

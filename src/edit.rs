@@ -1,88 +1,607 @@
 //! Line editing shared by every text field: the prompt, the rename box and the picker filter.
-//! None of them has a cursor, so editing acts on the end of the buffer.
+//!
+//! A collapsed paste sits in the text as one private-use character, so the cursor, word motions
+//! and deletion treat it as a single unit. It is replaced by what was pasted on the way out.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Applies an editing key to `buffer` and says whether it was one.
-///
-/// Option+⌫ (or Ctrl+⌫) deletes the last word, Cmd+⌫ and Ctrl+U clear the field. Ghostty sends
-/// Cmd+⌫ as Ctrl+U by default, so both spellings land here. Ctrl+W is kept for opening the PR.
-pub fn apply(buffer: &mut String, key: KeyEvent) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let word = KeyModifiers::ALT | KeyModifiers::CONTROL;
-    match key.code {
-        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => buffer.clear(),
-        KeyCode::Backspace if key.modifiers.intersects(word) => delete_word(buffer),
-        KeyCode::Backspace => {
-            buffer.pop();
-        }
-        KeyCode::Char('u') if ctrl => buffer.clear(),
-        KeyCode::Char(c) if !ctrl => buffer.push(c),
-        _ => return false,
-    }
-    true
+const PASTE_BASE: u32 = 0xE000;
+const PASTE_LAST: u32 = 0xF8FF;
+const COLLAPSE_CHARS: usize = 800;
+const COLLAPSE_LINES: usize = 3;
+const TAB: &str = "    ";
+
+#[derive(Debug, Default, Clone)]
+pub struct TextField {
+    text: String,
+    cursor: usize,
+    pastes: Vec<String>,
+    killed: String,
 }
 
-/// Deletes back to the start of the last word, like readline's backward-kill-word: the
-/// separators after it go too, so `acme/` becomes empty and `acme/bil` becomes `acme/`.
-fn delete_word(buffer: &mut String) {
-    let trimmed = buffer.trim_end_matches(|c: char| !c.is_alphanumeric());
-    let end = trimmed.trim_end_matches(char::is_alphanumeric).len();
-    buffer.truncate(end);
+/// A run of text on one drawn line; `paste` marks a collapsed paste's label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Piece {
+    pub text: String,
+    pub paste: bool,
+}
+
+pub struct Layout {
+    pub lines: Vec<Vec<Piece>>,
+    /// Row and column of the cursor, in cells.
+    pub cursor: (usize, usize),
+}
+
+impl From<&str> for TextField {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<String> for TextField {
+    fn from(text: String) -> Self {
+        Self::new(&text)
+    }
+}
+
+impl TextField {
+    pub fn new(text: &str) -> Self {
+        let mut field = Self::default();
+        field.insert(&clean(text, true));
+        field
+    }
+
+    /// The text as typed, with each collapsed paste as its placeholder character.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// The text with every collapsed paste put back in full.
+    pub fn expanded(&self) -> String {
+        self.text
+            .chars()
+            .map(|c| match self.paste_index(c) {
+                Some(i) => self.pastes[i].clone(),
+                None => c.to_string(),
+            })
+            .collect()
+    }
+
+    /// The text with every collapsed paste shown as its label.
+    pub fn shown(&self) -> String {
+        self.text
+            .chars()
+            .map(|c| match self.paste_index(c) {
+                Some(i) => self.label(i),
+                None => c.to_string(),
+            })
+            .collect()
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        self.insert(c.encode_utf8(&mut [0; 4]));
+    }
+
+    /// Pastes into a field that takes several lines. Nothing in a paste acts as a key. A long
+    /// paste collapses to a label; pasting the same text again opens it back up in place.
+    pub fn paste(&mut self, pasted: &str) {
+        let pasted = clean(pasted, true);
+        if let Some(c) = self.collapsed(&pasted) {
+            let at = self.text.find(c).unwrap_or(self.cursor);
+            self.text.replace_range(at..at + c.len_utf8(), "");
+            self.cursor = at;
+            self.insert(&pasted.replace('\t', TAB));
+        } else if pasted.chars().count() > COLLAPSE_CHARS || pasted.lines().count() > COLLAPSE_LINES
+        {
+            match char::from_u32(PASTE_BASE + self.pastes.len() as u32)
+                .filter(|&c| c as u32 <= PASTE_LAST)
+            {
+                Some(c) => {
+                    self.pastes.push(pasted);
+                    self.insert_char(c);
+                }
+                None => self.insert(&pasted.replace('\t', TAB)),
+            }
+        } else {
+            self.insert(&pasted.replace('\t', TAB));
+        }
+    }
+
+    /// Pastes into a one-line field: line breaks and tabs become spaces.
+    pub fn paste_line(&mut self, pasted: &str) {
+        let pasted = clean(pasted, true);
+        let flat: Vec<&str> = pasted.split_whitespace().collect();
+        self.insert(&flat.join(" "));
+    }
+
+    /// Applies an editing key and says whether it was one.
+    ///
+    /// The keys are the shell's (readline's), minus the ones Ratatosk uses for itself: Ctrl+W
+    /// opens the PR, Ctrl+B, Ctrl+D, Ctrl+F and Ctrl+P have their own jobs. Cmd+⌫ is sent as
+    /// Ctrl+U by Ghostty, so both delete to the start of the line.
+    pub fn apply(&mut self, key: KeyEvent) -> bool {
+        let m = key.modifiers;
+        let ctrl = m.contains(KeyModifiers::CONTROL);
+        let alt = m.contains(KeyModifiers::ALT);
+        let cmd = m.contains(KeyModifiers::SUPER);
+        let word = m.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Backspace if cmd => self.kill_to(self.line_start_or_join()),
+            KeyCode::Backspace if word => self.kill_to(self.word_back()),
+            KeyCode::Backspace => self.delete_to(self.prev()),
+            KeyCode::Delete if word => self.kill_to(self.word_forward()),
+            KeyCode::Delete => self.delete_to(self.next()),
+            KeyCode::Left if cmd => self.cursor = self.line_start(),
+            KeyCode::Right if cmd => self.cursor = self.line_end(),
+            KeyCode::Left if word => self.cursor = self.word_back(),
+            KeyCode::Right if word => self.cursor = self.word_forward(),
+            KeyCode::Left => self.cursor = self.prev(),
+            KeyCode::Right => self.cursor = self.next(),
+            KeyCode::Home => self.cursor = self.line_start(),
+            KeyCode::End => self.cursor = self.line_end(),
+            KeyCode::Char('a') if ctrl => self.cursor = self.line_start(),
+            KeyCode::Char('e') if ctrl => self.cursor = self.line_end(),
+            KeyCode::Char('u') if ctrl => self.kill_to(self.line_start_or_join()),
+            KeyCode::Char('k') if ctrl => self.kill_to(self.line_end_or_join()),
+            KeyCode::Char('y') if ctrl => self.insert(&self.killed.clone()),
+            KeyCode::Char('b') if alt => self.cursor = self.word_back(),
+            KeyCode::Char('f') if alt => self.cursor = self.word_forward(),
+            KeyCode::Char('d') if alt => self.kill_to(self.word_forward()),
+            KeyCode::Char(c) if !ctrl && !cmd => self.insert(&clean(&c.to_string(), false)),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Lays the text out in `width` cells, wrapping at spaces and breaking words longer than a
+    /// line, and says where the cursor lands.
+    pub fn layout(&self, width: usize) -> Layout {
+        let width = width.max(1);
+        let mut lines: Vec<Vec<(usize, String, bool)>> = vec![Vec::new()];
+        let mut used = 0;
+        let mut word: Vec<(usize, String, bool)> = Vec::new();
+        let mut word_width = 0;
+        let flush = |lines: &mut Vec<Vec<(usize, String, bool)>>,
+                     used: &mut usize,
+                     word: &mut Vec<(usize, String, bool)>,
+                     word_width: &mut usize| {
+            if *used > 0 && *used + *word_width > width {
+                lines.push(Vec::new());
+                *used = 0;
+            }
+            for unit in word.drain(..) {
+                let w = cells(&unit.1);
+                if *used > 0 && *used + w > width {
+                    lines.push(Vec::new());
+                    *used = 0;
+                }
+                *used += w;
+                lines.last_mut().unwrap().push(unit);
+            }
+            *word_width = 0;
+        };
+        for (at, c) in self.text.char_indices() {
+            if c == '\n' {
+                flush(&mut lines, &mut used, &mut word, &mut word_width);
+                lines.last_mut().unwrap().push((at, String::new(), false));
+                lines.push(Vec::new());
+                used = 0;
+            } else if c == ' ' {
+                flush(&mut lines, &mut used, &mut word, &mut word_width);
+                used += 1;
+                lines.last_mut().unwrap().push((at, " ".into(), false));
+            } else {
+                let unit = match self.paste_index(c) {
+                    Some(i) => (at, self.label(i), true),
+                    None => (at, c.to_string(), false),
+                };
+                word_width += cells(&unit.1);
+                word.push(unit);
+            }
+        }
+        flush(&mut lines, &mut used, &mut word, &mut word_width);
+
+        let mut cursor = None;
+        for (row, line) in lines.iter().enumerate() {
+            let mut col = 0;
+            for (at, text, _) in line {
+                if *at == self.cursor {
+                    cursor = Some((row, col));
+                }
+                col += cells(text);
+            }
+        }
+        let cursor = cursor.unwrap_or_else(|| {
+            let last = lines
+                .last()
+                .map_or(0, |l| l.iter().map(|u| cells(&u.1)).sum());
+            (lines.len() - 1, last)
+        });
+        let lines = lines
+            .into_iter()
+            .map(|line| {
+                let mut pieces: Vec<Piece> = Vec::new();
+                for (_, text, paste) in line {
+                    match pieces.last_mut() {
+                        Some(last) if last.paste == paste && !paste => last.text.push_str(&text),
+                        _ => pieces.push(Piece { text, paste }),
+                    }
+                }
+                pieces.retain(|p| !p.text.is_empty());
+                pieces
+            })
+            .collect();
+        Layout { lines, cursor }
+    }
+
+    fn paste_index(&self, c: char) -> Option<usize> {
+        let i = (c as u32).checked_sub(PASTE_BASE)? as usize;
+        (i < self.pastes.len()).then_some(i)
+    }
+
+    fn label(&self, i: usize) -> String {
+        match self.pastes[i].lines().count() {
+            n if n > 1 => format!("[Pasted text #{} +{n} lines]", i + 1),
+            _ => format!("[Pasted text #{}]", i + 1),
+        }
+    }
+
+    fn collapsed(&self, pasted: &str) -> Option<char> {
+        let i = self.pastes.iter().position(|p| p == pasted)?;
+        let c = char::from_u32(PASTE_BASE + i as u32)?;
+        self.text.contains(c).then_some(c)
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn delete_to(&mut self, to: usize) {
+        let range = self.cursor.min(to)..self.cursor.max(to);
+        self.text.replace_range(range.clone(), "");
+        self.cursor = range.start;
+    }
+
+    fn kill_to(&mut self, to: usize) {
+        let range = self.cursor.min(to)..self.cursor.max(to);
+        if !range.is_empty() {
+            self.killed = self.text[range].to_string();
+        }
+        self.delete_to(to);
+    }
+
+    fn prev(&self) -> usize {
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(i, _)| i)
+    }
+
+    fn next(&self) -> usize {
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map_or(self.cursor, |c| self.cursor + c.len_utf8())
+    }
+
+    fn line_start(&self) -> usize {
+        self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |i| self.cursor + i)
+    }
+
+    // At the edge of a line these take the line break, so pressing again joins the lines.
+    fn line_start_or_join(&self) -> usize {
+        match self.line_start() {
+            start if start == self.cursor => self.prev(),
+            start => start,
+        }
+    }
+
+    fn line_end_or_join(&self) -> usize {
+        match self.line_end() {
+            end if end == self.cursor => self.next(),
+            end => end,
+        }
+    }
+
+    /// Back to the start of the previous word, like readline's backward-word: the separators
+    /// after it are passed too, so from the end of `acme/bil` it stops after `acme/`. A
+    /// collapsed paste is a word of its own.
+    fn word_back(&self) -> usize {
+        let before = &self.text[..self.cursor];
+        let trimmed = before.trim_end_matches(|c| !self.is_word(c) && !self.is_paste(c));
+        match trimmed.chars().next_back() {
+            Some(c) if self.is_paste(c) => trimmed.len() - c.len_utf8(),
+            _ => trimmed.trim_end_matches(|c| self.is_word(c)).len(),
+        }
+    }
+
+    fn word_forward(&self) -> usize {
+        let after = &self.text[self.cursor..];
+        let trimmed = after.trim_start_matches(|c| !self.is_word(c) && !self.is_paste(c));
+        let rest = match trimmed.chars().next() {
+            Some(c) if self.is_paste(c) => &trimmed[c.len_utf8()..],
+            _ => trimmed.trim_start_matches(|c| self.is_word(c)),
+        };
+        self.text.len() - rest.len()
+    }
+
+    fn is_word(&self, c: char) -> bool {
+        c.is_alphanumeric() && !self.is_paste(c)
+    }
+
+    fn is_paste(&self, c: char) -> bool {
+        self.paste_index(c).is_some()
+    }
+}
+
+/// Keeps line breaks (as `\n`) and tabs only when `lines` is set, and drops other control
+/// characters and anything in the range that marks a collapsed paste.
+fn clean(text: &str, lines: bool) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|&c| (lines && matches!(c, '\n' | '\t')) || !c.is_control())
+        .filter(|&c| !(PASTE_BASE..=PASTE_LAST).contains(&(c as u32)))
+        .collect()
+}
+
+fn cells(text: &str) -> usize {
+    ratatui::text::Span::raw(text).width()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn edited(text: &str, key: KeyEvent) -> String {
-        let mut buffer = text.to_string();
-        assert!(apply(&mut buffer, key));
-        buffer
+    /// `|` marks the cursor, in and out.
+    fn field(text: &str) -> TextField {
+        let at = text.find('|').expect("a cursor");
+        let mut field = TextField::new(&text.replace('|', ""));
+        field.cursor = at;
+        field
     }
 
-    fn backspace(modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(KeyCode::Backspace, modifiers)
+    fn marked(field: &TextField) -> String {
+        let mut text = field.shown();
+        let shown_at: usize = field.text[..field.cursor]
+            .chars()
+            .map(|c| match field.paste_index(c) {
+                Some(i) => field.label(i).len(),
+                None => c.len_utf8(),
+            })
+            .sum();
+        text.insert(shown_at, '|');
+        text
+    }
+
+    fn edited(text: &str, key: KeyEvent) -> String {
+        let mut field = field(text);
+        assert!(field.apply(key), "{key:?}");
+        marked(&field)
+    }
+
+    fn with(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
     }
 
     fn ctrl(c: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+        with(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        with(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
     }
 
     #[test]
-    fn backspace_removes_one_char_and_typing_appends() {
-        assert_eq!(edited("ab", backspace(KeyModifiers::NONE)), "a");
-        assert_eq!(edited("a", KeyEvent::from(KeyCode::Char('b'))), "ab");
+    fn typing_and_backspace_act_at_the_cursor() {
+        assert_eq!(edited("ab|", key(KeyCode::Backspace)), "a|");
+        assert_eq!(edited("a|c", key(KeyCode::Char('b'))), "ab|c");
+        assert_eq!(edited("a|bc", key(KeyCode::Backspace)), "|bc");
+        assert_eq!(edited("a|bc", key(KeyCode::Delete)), "a|c");
+        assert_eq!(edited("|", key(KeyCode::Backspace)), "|");
+        assert_eq!(edited("æ|ø", key(KeyCode::Backspace)), "|ø");
     }
 
     #[test]
-    fn option_backspace_and_ctrl_backspace_delete_the_last_word() {
+    fn arrows_move_by_character_and_by_word() {
+        assert_eq!(edited("ab|c", key(KeyCode::Left)), "a|bc");
+        assert_eq!(edited("ab|c", key(KeyCode::Right)), "abc|");
+        assert_eq!(edited("|abc", key(KeyCode::Left)), "|abc");
         assert_eq!(
-            edited("fix the tests", backspace(KeyModifiers::ALT)),
-            "fix the "
+            edited("fix the tests|", with(KeyCode::Left, KeyModifiers::ALT)),
+            "fix the |tests"
         );
+        assert_eq!(edited("fix the| tests", alt('b')), "fix |the tests");
         assert_eq!(
-            edited("fix the  ", backspace(KeyModifiers::CONTROL)),
-            "fix "
+            edited(
+                "fix| the tests",
+                with(KeyCode::Right, KeyModifiers::CONTROL)
+            ),
+            "fix the| tests"
         );
-        assert_eq!(edited("acme/bil", backspace(KeyModifiers::ALT)), "acme/");
-        assert_eq!(edited("acme/", backspace(KeyModifiers::ALT)), "");
-        assert_eq!(edited("one\ntwo", backspace(KeyModifiers::ALT)), "one\n");
-        assert_eq!(edited("", backspace(KeyModifiers::ALT)), "");
+        assert_eq!(edited("|fix the", alt('f')), "fix| the");
     }
 
     #[test]
-    fn cmd_backspace_and_ctrl_u_clear_the_field() {
-        assert_eq!(edited("fix the\ntests", backspace(KeyModifiers::SUPER)), "");
-        assert_eq!(edited("fix the tests", ctrl('u')), "");
+    fn line_motions_stay_on_the_cursor_line() {
+        assert_eq!(edited("one\ntw|o\nthree", ctrl('a')), "one\n|two\nthree");
+        assert_eq!(edited("one\ntw|o\nthree", ctrl('e')), "one\ntwo|\nthree");
+        assert_eq!(edited("one\ntw|o", key(KeyCode::Home)), "one\n|two");
+        assert_eq!(edited("on|e\ntwo", key(KeyCode::End)), "one|\ntwo");
+        assert_eq!(
+            edited("one tw|o", with(KeyCode::Left, KeyModifiers::SUPER)),
+            "|one two"
+        );
     }
 
     #[test]
-    fn other_keys_are_left_alone() {
-        let mut buffer = "text".to_string();
-        assert!(!apply(&mut buffer, KeyEvent::from(KeyCode::Enter)));
-        assert!(!apply(&mut buffer, ctrl('x')));
-        assert!(!apply(&mut buffer, ctrl('w')));
-        assert_eq!(buffer, "text");
+    fn option_backspace_and_ctrl_backspace_delete_the_word_before_the_cursor() {
+        let word = |m| with(KeyCode::Backspace, m);
+        assert_eq!(
+            edited("fix the tests|", word(KeyModifiers::ALT)),
+            "fix the |"
+        );
+        assert_eq!(edited("fix the  |", word(KeyModifiers::CONTROL)), "fix |");
+        assert_eq!(edited("acme/bil|", word(KeyModifiers::ALT)), "acme/|");
+        assert_eq!(edited("acme/|", word(KeyModifiers::ALT)), "|");
+        assert_eq!(edited("one\ntwo|", word(KeyModifiers::ALT)), "one\n|");
+        assert_eq!(
+            edited("fix the| tests", word(KeyModifiers::ALT)),
+            "fix | tests"
+        );
+        assert_eq!(edited("|", word(KeyModifiers::ALT)), "|");
+        assert_eq!(edited("fix |the tests", alt('d')), "fix | tests");
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_k_kill_to_the_line_edges_and_ctrl_y_yanks_it_back() {
+        assert_eq!(edited("fix the| tests", ctrl('u')), "| tests");
+        assert_eq!(
+            edited(
+                "fix the| tests",
+                with(KeyCode::Backspace, KeyModifiers::SUPER)
+            ),
+            "| tests"
+        );
+        assert_eq!(edited("fix the| tests", ctrl('k')), "fix the|");
+        assert_eq!(edited("one\ntwo\n|three", ctrl('u')), "one\ntwo|three");
+        assert_eq!(edited("one|\ntwo", ctrl('k')), "one|two");
+
+        let mut f = field("fix the| tests");
+        f.apply(ctrl('u'));
+        f.apply(ctrl('e'));
+        f.apply(ctrl('y'));
+        assert_eq!(marked(&f), " testsfix the|");
+    }
+
+    #[test]
+    fn ctrl_w_and_unknown_keys_are_left_to_the_caller() {
+        let mut f = field("text|");
+        assert!(!f.apply(key(KeyCode::Enter)));
+        assert!(!f.apply(ctrl('x')));
+        assert!(!f.apply(ctrl('w')));
+        assert!(!f.apply(key(KeyCode::Up)));
+        assert_eq!(marked(&f), "text|");
+    }
+
+    #[test]
+    fn a_short_paste_goes_in_as_text_without_acting_on_its_newlines() {
+        let mut f = field("fix |now");
+        f.paste("the\r\nparser\t");
+        assert_eq!(marked(&f), "fix the\nparser    |now");
+        assert_eq!(f.expanded(), "fix the\nparser    now");
+    }
+
+    #[test]
+    fn a_long_paste_collapses_to_one_unit_and_expands_on_the_way_out() {
+        let trace = "panic at main.rs:1\n  frame 1\n  frame 2\n  frame 3\n";
+        let mut f = field("why |");
+        f.paste(trace);
+        f.insert(" again");
+        assert_eq!(marked(&f), "why [Pasted text #1 +4 lines] again|");
+        assert_eq!(f.expanded(), format!("why {trace} again"));
+
+        f.apply(alt('b'));
+        f.apply(alt('b'));
+        assert_eq!(marked(&f), "why |[Pasted text #1 +4 lines] again");
+        f.apply(key(KeyCode::Right));
+        assert_eq!(marked(&f), "why [Pasted text #1 +4 lines]| again");
+        f.apply(with(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(marked(&f), "why | again");
+        f.apply(alt('f'));
+        assert_eq!(marked(&f), "why  again|");
+    }
+
+    #[test]
+    fn a_long_single_line_paste_collapses_too() {
+        let mut f = field("|");
+        f.paste(&"x".repeat(COLLAPSE_CHARS + 1));
+        assert_eq!(f.shown(), "[Pasted text #1]");
+    }
+
+    #[test]
+    fn pasting_a_collapsed_text_again_opens_it_up() {
+        let trace = "a\nb\nc\nd";
+        let mut f = field("see |");
+        f.paste(trace);
+        f.paste(trace);
+        assert_eq!(marked(&f), "see a\nb\nc\nd|");
+    }
+
+    #[test]
+    fn typed_or_pasted_placeholder_characters_are_dropped() {
+        let mut f = field("|");
+        f.apply(key(KeyCode::Char('\u{E000}')));
+        f.paste("a\u{E001}b");
+        assert_eq!(f.text(), "ab");
+    }
+
+    #[test]
+    fn a_one_line_field_flattens_a_paste() {
+        let mut f = field("name|");
+        f.paste_line(" credit\n notes\t\r\n");
+        assert_eq!(marked(&f), "namecredit notes|");
+    }
+
+    #[test]
+    fn layout_wraps_at_spaces_and_follows_the_cursor() {
+        let f = field("fix the pa|rser now");
+        let layout = f.layout(9);
+        let lines: Vec<String> = layout
+            .lines
+            .iter()
+            .map(|l| l.iter().map(|p| p.text.as_str()).collect())
+            .collect();
+        assert_eq!(lines, ["fix the ", "parser ", "now"]);
+        assert_eq!(layout.cursor, (1, 2));
+
+        assert_eq!(field("one\n|").layout(10).cursor, (1, 0));
+        assert_eq!(field("abcdefghijkl|").layout(5).cursor, (2, 2));
+        assert_eq!(field("ab |").layout(5).cursor, (0, 3));
+    }
+
+    #[test]
+    fn layout_marks_a_collapsed_paste() {
+        let mut f = field("see |");
+        f.paste("a\nb\nc\nd");
+        let layout = f.layout(80);
+        assert_eq!(
+            layout.lines[0],
+            [
+                Piece {
+                    text: "see ".into(),
+                    paste: false
+                },
+                Piece {
+                    text: "[Pasted text #1 +4 lines]".into(),
+                    paste: true
+                }
+            ]
+        );
+        assert_eq!(layout.cursor, (0, 29));
     }
 }

@@ -212,6 +212,8 @@ impl Target {
 
 pub struct Draft {
     pub prompt: String,
+    /// The prompt as the confirmation shows it, with long pastes collapsed.
+    pub shown: String,
     pub target: Option<Target>,
     pub picker: Picker,
     pub model: Option<Model>,
@@ -233,6 +235,7 @@ impl Draft {
         rule: ManualModel,
     ) -> Self {
         let mut draft = Self {
+            shown: prompt.clone(),
             prompt,
             field: if target.is_some() {
                 Field::Model

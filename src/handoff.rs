@@ -21,8 +21,8 @@ use ratatui::{
     crossterm::{
         cursor,
         event::{
-            DisableFocusChange, EnableFocusChange, KeyboardEnhancementFlags,
-            PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+            DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
         },
         execute,
         terminal::{Clear, ClearType},
@@ -61,6 +61,7 @@ pub fn run(
     execute!(
         out,
         DisableFocusChange,
+        DisableBracketedPaste,
         cursor::MoveTo(0, 0),
         Clear(ClearType::All),
         cursor::Show
@@ -80,7 +81,7 @@ pub fn run(
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
-    execute!(out, EnableFocusChange)?;
+    execute!(out, EnableFocusChange, EnableBracketedPaste)?;
     terminal.clear()?;
     outcome
 }

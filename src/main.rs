@@ -33,8 +33,9 @@ use ratatui::{
     DefaultTerminal,
     crossterm::{
         event::{
-            self, DisableFocusChange, EnableFocusChange, Event, KeyEventKind,
-            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+            self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste,
+            EnableFocusChange, Event, KeyEventKind, KeyboardEnhancementFlags,
+            PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
         },
         execute,
         terminal::supports_keyboard_enhancement,
@@ -74,7 +75,7 @@ fn main() -> Result<()> {
 
 fn init() -> Result<DefaultTerminal> {
     let terminal = ratatui::init();
-    execute!(stdout(), EnableFocusChange)?;
+    execute!(stdout(), EnableFocusChange, EnableBracketedPaste)?;
     if keyboard_enhanced() {
         execute!(
             stdout(),
@@ -95,7 +96,7 @@ fn restore() {
     if keyboard_enhanced() {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(stdout(), DisableFocusChange);
+    let _ = execute!(stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
 }
 
@@ -117,6 +118,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                 app.refresh();
                 app.request_prs(Instant::now());
             }
+            Event::Paste(text) => app.on_paste(&text),
             Event::Key(key) if key.kind == KeyEventKind::Press => match app.on_key(key) {
                 Action::Quit => return Ok(()),
                 Action::Attach { id, dir, account } => {

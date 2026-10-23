@@ -15,7 +15,8 @@ use crate::{
     agents::{self, PrRef, Session, State},
     carried,
     config::{Config, ManualModel},
-    edit, git,
+    edit::TextField,
+    git,
     identity::Resolver,
     keychain::Keychain,
     launch::{self, Draft, Field, Launch, Repo, Target},
@@ -101,7 +102,7 @@ pub struct App {
     pub table: TableState,
     pub error: Option<String>,
     pub repos: Vec<Repo>,
-    pub input: String,
+    pub input: TextField,
     pub draft: Option<Draft>,
     pub recent_path: Option<PathBuf>,
     pub status: Option<String>,
@@ -115,7 +116,7 @@ pub struct App {
     pub carried_path: Option<PathBuf>,
     pub carried: HashMap<String, Vec<PrRef>>,
     pub claude_names: HashMap<String, String>,
-    pub renaming: Option<(String, String)>,
+    pub renaming: Option<(String, TextField)>,
     pub prs: HashMap<String, RepoPrs>,
     pub dir_repos: HashMap<PathBuf, String>,
     pub pr_lookup: Option<Receiver<pr::Found>>,
@@ -156,7 +157,7 @@ impl App {
             lines: Vec::new(),
             table: TableState::default(),
             error: None,
-            input: String::new(),
+            input: TextField::default(),
             draft: None,
             recent_path: recent::path(),
             status: None,
@@ -296,7 +297,7 @@ impl App {
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
             KeyCode::Char('o') if ctrl => return self.open_selected(),
             KeyCode::Char('l') if ctrl => return self.move_selected(),
-            KeyCode::Char('a') if ctrl => self.open_accounts(),
+            KeyCode::Char('a') if ctrl && self.input.is_empty() => self.open_accounts(),
             KeyCode::Char('s') if ctrl => {
                 self.view.sort = self.view.sort.next();
                 self.save_view();
@@ -305,7 +306,7 @@ impl App {
             }
             KeyCode::Char('r') if ctrl => {
                 if let Some(s) = self.selected_session() {
-                    self.renaming = Some((s.id.clone(), s.name.clone()));
+                    self.renaming = Some((s.id.clone(), TextField::new(&s.name)));
                 }
             }
             KeyCode::Esc if self.input.is_empty() => return Action::Quit,
@@ -315,23 +316,41 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
-                self.input.push('\n')
+                self.input.insert_char('\n')
             }
-            KeyCode::Char('j') if ctrl => self.input.push('\n'),
-            KeyCode::Enter if !self.input.trim().is_empty() => self.open_draft(),
+            KeyCode::Char('j') if ctrl => self.input.insert_char('\n'),
+            KeyCode::Enter if !self.input.text().trim().is_empty() => self.open_draft(),
             KeyCode::Enter if self.selected_index().is_none() => self.toggle_group(),
             KeyCode::Enter => return self.attach_selected(),
             KeyCode::Right if self.input.is_empty() => return self.list_right(),
-            _ if edit::apply(&mut self.input, key) => {}
+            KeyCode::Home if self.input.is_empty() && !self.lines.is_empty() => {
+                self.table.select(Some(0))
+            }
+            KeyCode::End if self.input.is_empty() && !self.lines.is_empty() => {
+                self.table.select(Some(self.lines.len() - 1))
+            }
+            _ if self.input.apply(key) => {}
             KeyCode::Up => self.step(-1, 1),
             KeyCode::Down => self.step(1, 1),
             KeyCode::PageUp => self.step(-1, 10),
             KeyCode::PageDown => self.step(1, 10),
-            KeyCode::Home if !self.lines.is_empty() => self.table.select(Some(0)),
-            KeyCode::End if !self.lines.is_empty() => self.table.select(Some(self.lines.len() - 1)),
             _ => {}
         }
         Action::None
+    }
+
+    /// Text pasted through bracketed paste: it is only ever typed in, never acted on.
+    pub fn on_paste(&mut self, text: &str) {
+        self.status = None;
+        if let Some((_, buffer)) = self.renaming.as_mut() {
+            buffer.paste_line(text);
+        } else if let Some(draft) = self.draft.as_mut() {
+            if draft.field == Field::Project {
+                draft.picker.paste(&self.repos, text);
+            }
+        } else if self.choosing.is_none() && self.picking_account.is_none() {
+            self.input.paste(text);
+        }
     }
 
     fn open_draft(&mut self) {
@@ -341,12 +360,13 @@ impl App {
             Scope::All | Scope::Loose(_) | Scope::Elsewhere => (self.selected_repo(), None),
         };
         let mut draft = Draft::new(
-            self.input.trim().to_string(),
+            self.input.expanded().trim().to_string(),
             target.map(Target::Repo),
             self.recent_repos(),
             &self.repos,
             self.manual_model.clone(),
         );
+        draft.shown = self.input.shown().trim().to_string();
         if let Some(org) = org {
             draft.picker.set_filter(&self.repos, format!("{org}/"));
         }
@@ -439,12 +459,12 @@ impl App {
         match key.code {
             KeyCode::Esc => self.renaming = None,
             KeyCode::Enter => {
-                let (id, name) = (id.clone(), buffer.trim().to_string());
+                let (id, name) = (id.clone(), buffer.text().trim().to_string());
                 self.renaming = None;
                 self.rename(&id, &name);
             }
             _ => {
-                edit::apply(buffer, key);
+                buffer.apply(key);
             }
         }
     }
@@ -1243,7 +1263,7 @@ mod tests {
             table: TableState::default().with_selected(Some(0)),
             error: None,
             repos: Vec::new(),
-            input: String::new(),
+            input: TextField::default(),
             draft: None,
             recent_path: None,
             status: None,
@@ -1303,7 +1323,7 @@ mod scope_tests {
             table: TableState::default(),
             error: None,
             repos: Vec::new(),
-            input: String::new(),
+            input: TextField::default(),
             draft: None,
             recent_path: None,
             status: None,
@@ -1414,7 +1434,7 @@ mod rename_tests {
         let mut app = app();
         type_text(&mut app, "fix the tests");
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
-        assert_eq!(app.input, "fix the ");
+        assert_eq!(app.input.text(), "fix the ");
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
         assert!(app.input.is_empty());
 
@@ -1422,9 +1442,9 @@ mod rename_tests {
         ctrl(&mut app, 'u');
         type_text(&mut app, "credit notes");
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
-        assert_eq!(app.renaming.as_ref().unwrap().1, "credit ");
+        assert_eq!(app.renaming.as_ref().unwrap().1.text(), "credit ");
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
-        assert_eq!(app.renaming.as_ref().unwrap().1, "");
+        assert_eq!(app.renaming.as_ref().unwrap().1.text(), "");
         press(&mut app, KeyCode::Esc);
         assert!(app.input.is_empty());
     }
@@ -1593,7 +1613,7 @@ mod draft_scope_tests {
         let draft = app.draft.unwrap();
         assert_eq!(draft.target, None);
         assert_eq!(draft.field, Field::Project);
-        assert_eq!(draft.picker.filter, "acme/");
+        assert_eq!(draft.picker.filter.text(), "acme/");
     }
 
     #[test]
@@ -1744,7 +1764,7 @@ mod collapse_tests {
     fn space_types_into_the_prompt() {
         let mut app = app();
         press(&mut app, KeyCode::Char(' '));
-        assert_eq!(app.input, " ");
+        assert_eq!(app.input.text(), " ");
     }
 
     #[test]
@@ -1908,8 +1928,39 @@ mod prompt_tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         app.on_key(KeyEvent::from(KeyCode::Char('b')));
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        assert_eq!(app.input, "a\nb\n");
+        assert_eq!(app.input.text(), "a\nb\n");
         assert!(app.draft.is_none());
+    }
+
+    #[test]
+    fn a_paste_is_typed_in_and_never_acted_on() {
+        let mut app = App::default();
+        app.on_paste("fix this\r\nnow\n");
+        assert_eq!(app.input.text(), "fix this\nnow\n");
+        assert!(app.draft.is_none());
+
+        let trace = "panic\n  at a\n  at b\n  at c";
+        app.on_paste(trace);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let draft = app.draft.as_ref().unwrap();
+        assert_eq!(draft.prompt, format!("fix this\nnow\n{trace}"));
+        assert_eq!(draft.shown, "fix this\nnow\n[Pasted text #1 +4 lines]");
+    }
+
+    #[test]
+    fn with_text_in_the_prompt_editing_keys_move_the_cursor_not_the_list() {
+        let mut app = App {
+            input: "fix tests".into(),
+            ..Default::default()
+        };
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(app.picking_account.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        app.on_key(KeyEvent::from(KeyCode::Char('!')));
+        assert_eq!(app.input.text(), "fix! tests");
+        app.on_key(KeyEvent::from(KeyCode::Home));
+        app.on_key(KeyEvent::from(KeyCode::Delete));
+        assert_eq!(app.input.text(), "ix! tests");
     }
 
     #[test]

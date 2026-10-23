@@ -43,7 +43,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let prompt_height = prompt_lines(app, frame.area().width).len() as u16 + 2;
+    let prompt_height = prompt_lines(app, frame.area().width).0.len() as u16 + 2;
     let [details, body, prompt, hints] = Layout::vertical([
         Constraint::Length(details_height),
         Constraint::Fill(1),
@@ -302,7 +302,10 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
                     Span::raw(" "),
                     match &view.renaming {
                         Some((id, buffer)) if *id == session.id => Span::styled(
-                            format!("{buffer}▏"),
+                            {
+                                let (before, after) = buffer.text().split_at(buffer.cursor());
+                                format!("{before}▏{after}")
+                            },
                             Style::new()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::UNDERLINED),
@@ -633,45 +636,52 @@ fn state_word(state: State) -> &'static str {
 
 const PROMPT_MAX_LINES: usize = 8;
 
-fn prompt_lines(app: &App, width: u16) -> Vec<String> {
+// The lines that fit, scrolled so the cursor stays in view, and the cursor's row and column
+// among them.
+fn prompt_lines(app: &App, width: u16) -> (Vec<TextLine<'static>>, (usize, usize)) {
+    let gutter = |n: usize| Span::raw(if n == 0 { "❯ " } else { "  " }).dim();
     if app.input.is_empty() {
-        return vec![PLACEHOLDER.to_string()];
+        return (
+            vec![TextLine::from(vec![
+                gutter(0),
+                Span::raw(PLACEHOLDER).dim(),
+            ])],
+            (0, 0),
+        );
     }
-    let lines = wrap_clipped(&app.input, (width as usize).saturating_sub(3), usize::MAX);
-    let skip = lines.len().saturating_sub(PROMPT_MAX_LINES);
-    lines.into_iter().skip(skip).collect()
+    let layout = app.input.layout((width as usize).saturating_sub(3));
+    let (row, col) = layout.cursor;
+    let skip = layout
+        .lines
+        .len()
+        .saturating_sub(PROMPT_MAX_LINES)
+        .min(row.saturating_sub(PROMPT_MAX_LINES - 1));
+    let lines = layout
+        .lines
+        .into_iter()
+        .enumerate()
+        .skip(skip)
+        .take(PROMPT_MAX_LINES)
+        .map(|(n, pieces)| {
+            let mut spans = vec![gutter(n)];
+            spans.extend(pieces.into_iter().map(|p| match p.paste {
+                true => Span::raw(p.text).fg(Color::Cyan),
+                false => Span::raw(p.text),
+            }));
+            TextLine::from(spans)
+        })
+        .collect();
+    (lines, (row - skip, col))
 }
 
 fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).dim();
     let inner = block.inner(area);
-    let lines = prompt_lines(app, inner.width);
-    let style = if app.input.is_empty() {
-        Style::new().add_modifier(Modifier::DIM)
-    } else {
-        Style::new()
-    };
-    let text: Vec<TextLine> = lines
-        .iter()
-        .enumerate()
-        .map(|(n, line)| {
-            TextLine::from(vec![
-                Span::raw(if n == 0 { "❯ " } else { "  " }).dim(),
-                Span::styled(line.clone(), style),
-            ])
-        })
-        .collect();
+    let (lines, (row, col)) = prompt_lines(app, inner.width);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
     if app.draft.is_none() {
-        let last = lines.len().saturating_sub(1);
-        let trailing_space = u16::from(app.input.ends_with(' '));
-        let col = if app.input.is_empty() {
-            0
-        } else {
-            text_width(&lines[last]) as u16 + trailing_space
-        };
-        frame.set_cursor_position((inner.x + 2 + col, inner.y + last as u16));
+        frame.set_cursor_position((inner.x + 2 + col as u16, inner.y + row as u16));
     }
 }
 
@@ -692,7 +702,7 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
     let hints: [&str; 2] = if app.renaming.is_some() {
         [
             "type the new name · enter to save · esc to cancel",
-            "opt+⌫ deletes a word · cmd+⌫ clears · an empty name goes back to Claude's own name",
+            "←→ move · opt+←→ by word · opt+⌫ deletes a word · cmd+⌫ to line start · an empty name goes back to Claude's own name",
         ]
     } else if app.focus == Focus::Menu {
         [
@@ -706,8 +716,8 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
         ]
     } else {
         [
-            "enter to review and start · shift+enter (or ctrl+j) for a new line",
-            "opt+⌫ deletes a word · cmd+⌫ or esc clears",
+            "enter to review and start · shift+enter (or ctrl+j) for a new line · esc clears",
+            "←→ move · opt+←→ by word · ctrl+a/e line start/end · opt+⌫ deletes a word · ctrl+u/k delete to start/end · ctrl+y puts it back",
         ]
     };
     frame.render_widget(
@@ -744,7 +754,7 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
 
     let box_width = frame.area().width.min(DRAFT_WIDTH);
     let text_room = box_width.saturating_sub(4) as usize;
-    let mut lines = labelled("  prompt   ", &draft.prompt, text_room, 6, Style::new());
+    let mut lines = labelled("  prompt   ", &draft.shown, text_room, 6, Style::new());
     lines.push(TextLine::default());
     lines.push(field(
         Field::Project,
@@ -756,11 +766,12 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
         let filter_line = TextLine::from(vec![
             Span::raw("           "),
             Span::styled("filter ", Style::new().fg(Color::Cyan)),
-            Span::raw(draft.picker.filter.as_str()),
+            Span::raw(draft.picker.filter.text().to_string()),
         ]);
+        let filter = &draft.picker.filter;
         cursor = Some((
             lines.len(),
-            18 + TextLine::from(draft.picker.filter.as_str()).width(),
+            18 + text_width(&filter.text()[..filter.cursor()]),
         ));
         lines.push(filter_line);
         lines.extend(picker_lines(&draft.picker, repos));
@@ -1105,7 +1116,7 @@ mod tests {
                 folder_org: "globex".into(),
                 folder: "engine".into(),
             }],
-            input: String::new(),
+            input: Default::default(),
             draft: None,
             recent_path: None,
             status: None,
@@ -1246,10 +1257,11 @@ mod tests {
     #[test]
     fn a_long_prompt_wraps_over_several_lines_and_keeps_newlines() {
         let mut app = app();
-        app.input = format!("{} the end\nsecond line", "word ".repeat(60));
-        let lines = prompt_lines(&app, 80);
+        app.input = format!("{} the end\nsecond line", "word ".repeat(60)).into();
+        let (lines, cursor) = prompt_lines(&app, 80);
         assert!(lines.len() > 2, "{lines:?}");
-        assert_eq!(lines.last().map(String::as_str), Some("second line"));
+        assert_eq!(lines.last().unwrap().to_string(), "  second line");
+        assert_eq!(cursor, (lines.len() - 1, 11));
         let screen = screen(&mut app);
         assert!(screen.contains("the end"), "{screen}");
         assert!(screen.contains("second line"), "{screen}");
@@ -1266,7 +1278,7 @@ mod tests {
         let mut app = app();
         app.input = "fix the parser".into();
         let mut draft = Draft::new(
-            app.input.clone(),
+            app.input.text().to_string(),
             Some(Target::Repo(0)),
             Vec::new(),
             &app.repos,
@@ -1287,7 +1299,7 @@ mod tests {
         let mut app = app();
         app.input = "start a tool".into();
         app.draft = Some(Draft::new(
-            app.input.clone(),
+            app.input.text().to_string(),
             None,
             Vec::new(),
             &app.repos,
@@ -1310,7 +1322,7 @@ mod tests {
         let mut app = app();
         app.input = "fix the parser".into();
         app.draft = Some(Draft::new(
-            app.input.clone(),
+            app.input.text().to_string(),
             Some(Target::Repo(0)),
             Vec::new(),
             &app.repos,
@@ -1372,7 +1384,7 @@ mod menu_tests {
             table: TableState::default().with_selected(Some(1)),
             error: None,
             repos: Vec::new(),
-            input: String::new(),
+            input: Default::default(),
             draft: None,
             recent_path: None,
             status: None,

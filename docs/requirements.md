@@ -71,7 +71,12 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
     - `^A` switches the account of the default login.
     - `^W` opens the PR on GitHub.
     - `^D` prunes merged worktrees.
-  - Line editing is the same in every text field (the prompt, the rename box, the project filter). Option+⌫ (or Ctrl+⌫) deletes the last word; Cmd+⌫ and `^U` clear the field. `^W` is not a word delete here, since it opens the PR. Ghostty sends Cmd+⌫ as `^U` by default, so both are handled. The fields have no cursor, so there is no `^A`/`^E`/`^K`.
+  - Line editing is the same in every text field (the prompt, the rename box, the project filter), and follows the shell's (readline's) keys where Ratatosk doesn't use them for something else. Every field has a cursor:
+    - ←/→ move by character; Option+←/→ (or Ctrl+←/→, Alt+B/Alt+F) by word; Home/End, Cmd+←/→, `^A` and `^E` to the start and end of the line. In the prompt, ←/→/Home/End act on the list while the prompt is empty, and `^A` opens accounts only then. In the project filter ←/→ stay on the tree.
+    - ⌫ and Delete delete a character; Option+⌫ (or Ctrl+⌫) the word before the cursor, Alt+D or Option+Delete the word after it.
+    - Cmd+⌫ and `^U` delete to the start of the line, `^K` to its end; at the edge of a line they join it to the next one. Ghostty sends Cmd+⌫ as `^U` by default, so both are handled. `^Y` puts back what was deleted last.
+    - `^W` is not a word delete here, since it opens the PR, and `^B`, `^D`, `^F` and `^P` keep their own jobs.
+- Pasting never acts on what is pasted: Ratatosk turns on bracketed paste, so a newline in a paste is text, not Enter. A paste into the rename box or the project filter has its line breaks turned into spaces. As in the agents view, a paste longer than 800 characters or more than three lines collapses in the prompt to a `[Pasted text #N +L lines]` label, which the cursor and deletion treat as one character; the full text is sent on start. Pasting the same text again opens it up in place. The confirmation shows the label too.
 - `?` with an empty prompt shows all keys.
 - The key hints sit in a grid below the prompt line, in the agents view's wording ("ctrl+r to rename").
 
