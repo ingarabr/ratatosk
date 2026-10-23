@@ -12,7 +12,8 @@ use ratatui::{
 
 use crate::{
     account::{self, Accounts},
-    agents::{self, Session, State},
+    agents::{self, PrRef, Session, State},
+    carried,
     config::{Config, ManualModel},
     edit, git,
     identity::Resolver,
@@ -85,6 +86,7 @@ pub struct Move {
     pub cwd: PathBuf,
     pub running: bool,
     pub in_worktree: bool,
+    pub prs: Vec<PrRef>,
     pub from: usize,
     pub to: usize,
 }
@@ -110,6 +112,8 @@ pub struct App {
     pub manual_model: ManualModel,
     pub names_path: Option<PathBuf>,
     pub names: HashMap<String, String>,
+    pub carried_path: Option<PathBuf>,
+    pub carried: HashMap<String, Vec<PrRef>>,
     pub claude_names: HashMap<String, String>,
     pub renaming: Option<(String, String)>,
     pub prs: HashMap<String, RepoPrs>,
@@ -163,6 +167,10 @@ impl App {
             manual_model: config.manual_model(),
             names: names::path().map(|p| names::load(&p)).unwrap_or_default(),
             names_path: names::path(),
+            carried: carried::path()
+                .map(|p| carried::load(&p))
+                .unwrap_or_default(),
+            carried_path: carried::path(),
             claude_names: HashMap::new(),
             renaming: None,
             prs: HashMap::new(),
@@ -200,6 +208,15 @@ impl App {
         }
         if errors.len() < accounts.len() {
             hide_moved(&mut sessions);
+            for session in &mut sessions {
+                if let Some(prs) = session
+                    .session_id
+                    .as_ref()
+                    .and_then(|id| self.carried.get(id))
+                {
+                    carried::merge(&mut session.prs, prs);
+                }
+            }
             self.claude_names.clear();
             for session in &mut sessions {
                 if let Some(name) = self.names.get(&session.id) {
@@ -607,6 +624,7 @@ impl App {
             cwd: session.cwd.clone(),
             running: session.running,
             in_worktree: self.places[i].worktree().is_some(),
+            prs: session.prs.clone(),
             from: session.account,
             to,
         })
@@ -677,6 +695,18 @@ impl App {
     pub fn sync_pool(&mut self) {
         if let (Some(pool), Some(_)) = (self.pool.as_mut(), &self.signed_in) {
             let _ = pool.sync(&Keychain);
+        }
+    }
+
+    pub fn carry_prs(&mut self, session_id: &str, prs: &[PrRef]) {
+        if prs.is_empty() {
+            return;
+        }
+        carried::merge(self.carried.entry(session_id.to_string()).or_default(), prs);
+        if let Some(path) = &self.carried_path
+            && let Err(err) = carried::save(path, &self.carried)
+        {
+            self.error = Some(format!("could not save the moved session's PRs: {err}"));
         }
     }
 
@@ -1060,16 +1090,27 @@ impl App {
 }
 
 // A session moved to a pinned account from a worktree keeps a stopped entry on the account it
-// left, since removing that would delete the worktree; only the copy on the pinned account shows.
+// left, since removing that would delete the worktree; only the copy on the pinned account shows,
+// with the PRs the old one was linked to.
 fn hide_moved(sessions: &mut Vec<Session>) {
     let moved: Vec<String> = sessions
         .iter()
         .filter(|s| s.account != account::DEFAULT)
         .filter_map(|s| s.session_id.clone())
         .collect();
-    sessions.retain(|s| {
-        s.account != account::DEFAULT || s.session_id.as_ref().is_none_or(|id| !moved.contains(id))
+    let mut left: HashMap<String, Vec<PrRef>> = HashMap::new();
+    sessions.retain(|s| match &s.session_id {
+        Some(id) if s.account == account::DEFAULT && moved.contains(id) => {
+            left.insert(id.clone(), s.prs.clone());
+            false
+        }
+        _ => true,
     });
+    for session in sessions {
+        if let Some(prs) = session.session_id.as_ref().and_then(|id| left.get(id)) {
+            carried::merge(&mut session.prs, prs);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1162,12 +1203,17 @@ mod tests {
     fn a_session_moved_to_a_pinned_account_shows_once() {
         let mut sessions = app_with(&["old", "new", "other"]).sessions;
         sessions[0].session_id = Some("s1".into());
+        sessions[0].prs = vec![PrRef {
+            repo: "acme/billing".into(),
+            number: 7,
+        }];
         sessions[1].session_id = Some("s1".into());
         sessions[1].account = 1;
         sessions[2].session_id = Some("s2".into());
         hide_moved(&mut sessions);
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["new", "other"]);
+        assert_eq!(sessions[0].prs.len(), 1, "the old entry's PRs carry over");
     }
 
     fn app_with(ids: &[&str]) -> App {

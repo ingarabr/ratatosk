@@ -56,7 +56,7 @@ pub struct Session {
     pub running: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct PrRef {
     pub repo: String,
     pub number: u64,

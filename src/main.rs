@@ -1,6 +1,7 @@
 mod account;
 mod agents;
 mod app;
+mod carried;
 mod config;
 mod edit;
 mod git;
@@ -367,6 +368,7 @@ fn move_session(terminal: &mut DefaultTerminal, app: &mut App, planned: &Move) -
     );
     // `claude rm` also deletes a worktree Claude created for the session, which the resumed
     // session still runs in. Such an old entry is left stopped; Ratatosk hides it.
+    app.carry_prs(&planned.session_id, &planned.prs);
     if !planned.in_worktree {
         agents::remove(&from, &planned.id)?;
     }
