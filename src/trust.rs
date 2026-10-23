@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use serde::Deserialize;
 
-use crate::account::Account;
+use crate::{account::Account, git};
 
 #[derive(Deserialize)]
 struct ClaudeConfig {
@@ -16,12 +16,16 @@ struct ProjectConfig {
     trusted: bool,
 }
 
-// Whether Claude Code's trust prompt was accepted for exactly this folder; `claude --bg`
-// refuses to start in one that wasn't. Each account keeps its own answers. None when the
-// account's .claude.json can't be read.
+// Whether Claude Code's trust prompt was accepted for this folder; `claude --bg` refuses to
+// start in one that wasn't, and a trusted parent folder doesn't count. A worktree is trusted
+// through its main checkout: Claude Code files the answer there. Each account keeps its own
+// answers. None when the account's .claude.json can't be read.
 pub fn is_trusted(account: &Account, dir: &Path) -> Option<bool> {
     let bytes = fs::read(account.global_config()).ok()?;
-    Some(trusted_in(&bytes, dir))
+    Some(
+        trusted_in(&bytes, dir)
+            || git::main_checkout(dir).is_some_and(|root| trusted_in(&bytes, &root)),
+    )
 }
 
 fn trusted_in(config: &[u8], dir: &Path) -> bool {
