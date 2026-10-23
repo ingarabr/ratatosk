@@ -306,7 +306,7 @@ impl App {
             }
             KeyCode::Char('r') if ctrl => {
                 if let Some(s) = self.selected_session() {
-                    self.renaming = Some((s.id.clone(), TextField::new(&s.name)));
+                    self.renaming = Some((s.id.clone(), TextField::one_line(&s.name)));
                 }
             }
             KeyCode::Esc if self.input.is_empty() => return Action::Quit,
@@ -343,7 +343,7 @@ impl App {
     pub fn on_paste(&mut self, text: &str) {
         self.status = None;
         if let Some((_, buffer)) = self.renaming.as_mut() {
-            buffer.paste_line(text);
+            buffer.paste(text);
         } else if let Some(draft) = self.draft.as_mut() {
             if draft.field == Field::Project {
                 draft.picker.paste(&self.repos, text);

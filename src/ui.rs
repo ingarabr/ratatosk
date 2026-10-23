@@ -18,6 +18,7 @@ use crate::{
     account,
     agents::State,
     app::{AccountPicker, App, Choice, Focus, Line},
+    input::Input,
     launch::{Draft, Field, Repo, Target},
     picker::{Item, Picker},
     place::{Kind, Place, Scope},
@@ -43,7 +44,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         0
     };
-    let prompt_height = prompt_lines(app, frame.area().width).0.len() as u16 + 2;
+    let prompt_height = prompt_input(app).height(frame.area().width) + 2;
     let [details, body, prompt, hints] = Layout::vertical([
         Constraint::Length(details_height),
         Constraint::Fill(1),
@@ -295,30 +296,29 @@ fn draw_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Line::Session(i) => {
             let session = &view.sessions[*i];
-            Row::new(vec![
-                Cell::from(TextLine::from(vec![
-                    Span::raw("  "),
-                    Span::styled(session.state.glyph(), state_style(session.state)),
-                    Span::raw(" "),
-                    match &view.renaming {
-                        Some((id, buffer)) if *id == session.id => Span::styled(
-                            {
-                                let (before, after) = buffer.text().split_at(buffer.cursor());
-                                format!("{before}▏{after}")
-                            },
+            let mut name = vec![
+                Span::raw("  "),
+                Span::styled(session.state.glyph(), state_style(session.state)),
+                Span::raw(" "),
+            ];
+            match &view.renaming {
+                Some((id, buffer)) if *id == session.id => name.extend(
+                    Input::new(buffer)
+                        .style(
                             Style::new()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::UNDERLINED),
-                        ),
-                        _ => Span::raw(session.name.as_str()),
-                    },
-                    match view.misplaced(*i) {
-                        Some(want) => {
-                            Span::raw(format!("  ⚠ not on {}", view.accounts.get(want).name)).red()
-                        }
-                        None => Span::raw(""),
-                    },
-                ])),
+                        )
+                        .line_with_bar()
+                        .spans,
+                ),
+                _ => name.push(Span::raw(session.name.as_str())),
+            }
+            if let Some(want) = view.misplaced(*i) {
+                name.push(Span::raw(format!("  ⚠ not on {}", view.accounts.get(want).name)).red());
+            }
+            Row::new(vec![
+                Cell::from(TextLine::from(name)),
                 Cell::from(if view.places[*i].worktree().is_some() {
                     WORKTREE
                 } else {
@@ -636,53 +636,18 @@ fn state_word(state: State) -> &'static str {
 
 const PROMPT_MAX_LINES: usize = 8;
 
-// The lines that fit, scrolled so the cursor stays in view, and the cursor's row and column
-// among them.
-fn prompt_lines(app: &App, width: u16) -> (Vec<TextLine<'static>>, (usize, usize)) {
-    let gutter = |n: usize| Span::raw(if n == 0 { "❯ " } else { "  " }).dim();
-    if app.input.is_empty() {
-        return (
-            vec![TextLine::from(vec![
-                gutter(0),
-                Span::raw(PLACEHOLDER).dim(),
-            ])],
-            (0, 0),
-        );
-    }
-    let layout = app.input.layout((width as usize).saturating_sub(3));
-    let (row, col) = layout.cursor;
-    let skip = layout
-        .lines
-        .len()
-        .saturating_sub(PROMPT_MAX_LINES)
-        .min(row.saturating_sub(PROMPT_MAX_LINES - 1));
-    let lines = layout
-        .lines
-        .into_iter()
-        .enumerate()
-        .skip(skip)
-        .take(PROMPT_MAX_LINES)
-        .map(|(n, pieces)| {
-            let mut spans = vec![gutter(n)];
-            spans.extend(pieces.into_iter().map(|p| match p.paste {
-                true => Span::raw(p.text).fg(Color::Cyan),
-                false => Span::raw(p.text),
-            }));
-            TextLine::from(spans)
-        })
-        .collect();
-    (lines, (row - skip, col))
+fn prompt_input(app: &App) -> Input<'_> {
+    Input::new(&app.input)
+        .prefix(Span::raw("❯ ").dim())
+        .placeholder(PLACEHOLDER)
+        .max_lines(PROMPT_MAX_LINES)
 }
 
 fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).dim();
     let inner = block.inner(area);
-    let (lines, (row, col)) = prompt_lines(app, inner.width);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
-    if app.draft.is_none() {
-        frame.set_cursor_position((inner.x + 2 + col as u16, inner.y + row as u16));
-    }
+    prompt_input(app).render(frame, inner, app.draft.is_none());
 }
 
 fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
@@ -763,17 +728,15 @@ fn draw_draft(frame: &mut Frame, app: &App, draft: &Draft) {
     ));
     let mut cursor = None;
     if picking {
-        let filter_line = TextLine::from(vec![
-            Span::raw("           "),
-            Span::styled("filter ", Style::new().fg(Color::Cyan)),
-            Span::raw(draft.picker.filter.text().to_string()),
-        ]);
-        let filter = &draft.picker.filter;
-        cursor = Some((
-            lines.len(),
-            18 + text_width(&filter.text()[..filter.cursor()]),
-        ));
-        lines.push(filter_line);
+        let (filter, at) = Input::new(&draft.picker.filter)
+            .prefix(vec![
+                Span::raw("           "),
+                Span::styled("filter ", Style::new().fg(Color::Cyan)),
+            ])
+            .max_lines(1)
+            .lines(text_room as u16);
+        cursor = Some((lines.len(), at.x as usize));
+        lines.extend(filter);
         lines.extend(picker_lines(&draft.picker, repos));
     }
     lines.push(field(
@@ -1258,10 +1221,13 @@ mod tests {
     fn a_long_prompt_wraps_over_several_lines_and_keeps_newlines() {
         let mut app = app();
         app.input = format!("{} the end\nsecond line", "word ".repeat(60)).into();
-        let (lines, cursor) = prompt_lines(&app, 80);
+        let (lines, cursor) = prompt_input(&app).lines(80);
         assert!(lines.len() > 2, "{lines:?}");
         assert_eq!(lines.last().unwrap().to_string(), "  second line");
-        assert_eq!(cursor, (lines.len() - 1, 11));
+        assert_eq!(
+            cursor,
+            ratatui::layout::Position::new(13, lines.len() as u16 - 1)
+        );
         let screen = screen(&mut app);
         assert!(screen.contains("the end"), "{screen}");
         assert!(screen.contains("second line"), "{screen}");

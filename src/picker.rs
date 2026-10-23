@@ -36,7 +36,7 @@ pub struct Picker {
 impl Picker {
     pub fn new(recent: Vec<usize>, repos: &[Repo]) -> Self {
         let mut picker = Self {
-            filter: TextField::default(),
+            filter: TextField::one_line(""),
             cursor: 0,
             open: BTreeSet::new(),
             recent,
@@ -171,7 +171,7 @@ impl Picker {
     }
 
     pub fn paste(&mut self, repos: &[Repo], text: &str) {
-        self.filter.paste_line(text);
+        self.filter.paste(text);
         self.reset_cursor(repos);
     }
 
@@ -184,7 +184,7 @@ impl Picker {
     }
 
     pub fn set_filter(&mut self, repos: &[Repo], filter: String) {
-        self.filter = TextField::new(&filter);
+        self.filter = TextField::one_line(&filter);
         self.reset_cursor(repos);
     }
 }

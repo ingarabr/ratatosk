@@ -7,6 +7,7 @@ mod edit;
 mod git;
 mod handoff;
 mod identity;
+mod input;
 mod keychain;
 mod launch;
 mod lockfile;

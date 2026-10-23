@@ -1,4 +1,4 @@
-//! Line editing shared by every text field: the prompt, the rename box and the picker filter.
+//! What a text field holds and how keys and pastes change it. `input::Input` draws one.
 //!
 //! A collapsed paste sits in the text as one private-use character, so the cursor, word motions
 //! and deletion treat it as a single unit. It is replaced by what was pasted on the way out.
@@ -11,12 +11,19 @@ const COLLAPSE_CHARS: usize = 800;
 const COLLAPSE_LINES: usize = 3;
 const TAB: &str = "    ";
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct TextField {
     text: String,
     cursor: usize,
+    multiline: bool,
     pastes: Vec<String>,
     killed: String,
+}
+
+impl Default for TextField {
+    fn default() -> Self {
+        Self::new("")
+    }
 }
 
 /// A run of text on one drawn line; `paste` marks a collapsed paste's label.
@@ -45,19 +52,30 @@ impl From<String> for TextField {
 }
 
 impl TextField {
+    /// A field that takes line breaks, and collapses long pastes.
     pub fn new(text: &str) -> Self {
-        let mut field = Self::default();
+        let mut field = Self {
+            text: String::new(),
+            cursor: 0,
+            multiline: true,
+            pastes: Vec::new(),
+            killed: String::new(),
+        };
         field.insert(&clean(text, true));
+        field
+    }
+
+    /// A field that stays on one line: line breaks typed or pasted into it become spaces.
+    pub fn one_line(text: &str) -> Self {
+        let mut field = Self::new("");
+        field.multiline = false;
+        field.insert(&flatten(text));
         field
     }
 
     /// The text as typed, with each collapsed paste as its placeholder character.
     pub fn text(&self) -> &str {
         &self.text
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
     }
 
     pub fn is_empty(&self) -> bool {
@@ -82,22 +100,28 @@ impl TextField {
 
     /// The text with every collapsed paste shown as its label.
     pub fn shown(&self) -> String {
-        self.text
-            .chars()
-            .map(|c| match self.paste_index(c) {
-                Some(i) => self.label(i),
-                None => c.to_string(),
-            })
-            .collect()
+        self.shown_from(&self.text)
+    }
+
+    /// The shown text on either side of the cursor.
+    pub fn shown_around_cursor(&self) -> (String, String) {
+        let (before, after) = self.text.split_at(self.cursor);
+        (self.shown_from(before), self.shown_from(after))
     }
 
     pub fn insert_char(&mut self, c: char) {
-        self.insert(c.encode_utf8(&mut [0; 4]));
+        if c != '\n' || self.multiline {
+            self.insert(c.encode_utf8(&mut [0; 4]));
+        }
     }
 
-    /// Pastes into a field that takes several lines. Nothing in a paste acts as a key. A long
-    /// paste collapses to a label; pasting the same text again opens it back up in place.
+    /// Nothing in a paste acts as a key. In a one-line field line breaks become spaces. In a
+    /// multi-line one a long paste collapses to a label, and pasting the same text again opens
+    /// it back up in place.
     pub fn paste(&mut self, pasted: &str) {
+        if !self.multiline {
+            return self.insert(&flatten(pasted));
+        }
         let pasted = clean(pasted, true);
         if let Some(c) = self.collapsed(&pasted) {
             let at = self.text.find(c).unwrap_or(self.cursor);
@@ -118,13 +142,6 @@ impl TextField {
         } else {
             self.insert(&pasted.replace('\t', TAB));
         }
-    }
-
-    /// Pastes into a one-line field: line breaks and tabs become spaces.
-    pub fn paste_line(&mut self, pasted: &str) {
-        let pasted = clean(pasted, true);
-        let flat: Vec<&str> = pasted.split_whitespace().collect();
-        self.insert(&flat.join(" "));
     }
 
     /// Applies an editing key and says whether it was one.
@@ -247,6 +264,15 @@ impl TextField {
         Layout { lines, cursor }
     }
 
+    fn shown_from(&self, text: &str) -> String {
+        text.chars()
+            .map(|c| match self.paste_index(c) {
+                Some(i) => self.label(i),
+                None => c.to_string(),
+            })
+            .collect()
+    }
+
     fn paste_index(&self, c: char) -> Option<usize> {
         let i = (c as u32).checked_sub(PASTE_BASE)? as usize;
         (i < self.pastes.len()).then_some(i)
@@ -365,6 +391,11 @@ fn clean(text: &str, lines: bool) -> String {
         .collect()
 }
 
+fn flatten(text: &str) -> String {
+    let text = clean(text, true);
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn cells(text: &str) -> usize {
     ratatui::text::Span::raw(text).width()
 }
@@ -382,16 +413,8 @@ mod tests {
     }
 
     fn marked(field: &TextField) -> String {
-        let mut text = field.shown();
-        let shown_at: usize = field.text[..field.cursor]
-            .chars()
-            .map(|c| match field.paste_index(c) {
-                Some(i) => field.label(i).len(),
-                None => c.len_utf8(),
-            })
-            .sum();
-        text.insert(shown_at, '|');
-        text
+        let (before, after) = field.shown_around_cursor();
+        format!("{before}|{after}")
     }
 
     fn edited(text: &str, key: KeyEvent) -> String {
@@ -561,10 +584,14 @@ mod tests {
     }
 
     #[test]
-    fn a_one_line_field_flattens_a_paste() {
-        let mut f = field("name|");
-        f.paste_line(" credit\n notes\t\r\n");
-        assert_eq!(marked(&f), "namecredit notes|");
+    fn a_one_line_field_flattens_a_paste_and_takes_no_line_breaks() {
+        let mut f = TextField::one_line("na\nme");
+        f.paste(&format!(
+            " credit\n notes\t\r\n{}",
+            "x\n".repeat(COLLAPSE_LINES)
+        ));
+        f.insert_char('\n');
+        assert_eq!(marked(&f), "na mecredit notes x x x|");
     }
 
     #[test]
