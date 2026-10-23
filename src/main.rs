@@ -4,6 +4,7 @@ mod app;
 mod carried;
 mod config;
 mod edit;
+mod editor;
 mod git;
 mod handoff;
 mod identity;
@@ -23,7 +24,7 @@ mod trust;
 mod ui;
 
 use std::{
-    io::stdout,
+    io::{Write, stdout},
     path::Path,
     sync::OnceLock,
     time::{Duration, Instant},
@@ -44,7 +45,7 @@ use ratatui::{
 };
 
 use account::Account;
-use app::{Action, App, Line, Move};
+use app::{Action, App, Editing, Line, Move};
 
 fn main() -> Result<()> {
     let config = config::Config::load()?;
@@ -77,6 +78,7 @@ fn main() -> Result<()> {
 fn init() -> Result<DefaultTerminal> {
     let terminal = ratatui::init();
     execute!(stdout(), EnableFocusChange, EnableBracketedPaste)?;
+    stdout().write_all(handoff::MOUSE_ON)?;
     if keyboard_enhanced() {
         execute!(
             stdout(),
@@ -97,6 +99,7 @@ fn restore() {
     if keyboard_enhanced() {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
+    let _ = stdout().write_all(handoff::MOUSE_OFF);
     let _ = execute!(stdout(), DisableFocusChange, DisableBracketedPaste);
     ratatui::restore();
 }
@@ -114,13 +117,22 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
         if !event::poll(timeout)? {
             continue;
         }
-        match event::read()? {
+        let action = match event::read()? {
             Event::FocusGained => {
                 app.refresh();
                 app.request_prs(Instant::now());
+                continue;
             }
-            Event::Paste(text) => app.on_paste(&text),
-            Event::Key(key) if key.kind == KeyEventKind::Press => match app.on_key(key) {
+            Event::Paste(text) => {
+                app.on_paste(&text);
+                continue;
+            }
+            Event::Mouse(mouse) => app.on_mouse(mouse, Instant::now()),
+            Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+            _ => continue,
+        };
+        {
+            match action {
                 Action::Quit => return Ok(()),
                 Action::Attach { id, dir, account } => {
                     let account = app.accounts.get(account).clone();
@@ -207,11 +219,24 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                         Err(err) => format!("{err:#}"),
                     });
                 }
+                Action::Edit(editing) => edit_text(terminal, &mut app, editing)?,
                 Action::None => {}
-            },
-            _ => {}
+            }
         }
     }
+}
+
+fn edit_text(terminal: &mut DefaultTerminal, app: &mut App, editing: Editing) -> Result<()> {
+    let text = match editing {
+        Editing::Prompt => app.input.expanded(),
+        Editing::Paste(i) => app.input.pasted(i).to_string(),
+    };
+    match editor::edit(terminal, &text, keyboard_enhanced()) {
+        Ok(Some(saved)) => app.edited(editing, &saved),
+        Ok(None) => app.status = Some("left the editor; nothing changed".to_string()),
+        Err(err) => app.status = Some(format!("{err:#}")),
+    }
+    Ok(())
 }
 
 fn start(

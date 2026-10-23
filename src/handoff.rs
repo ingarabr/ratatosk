@@ -36,6 +36,10 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 // Modes a child that was hung up on may leave behind: mouse, focus, paste, synchronized
 // output, a hidden cursor and an open SGR.
+/// Clicks and the wheel, without motion, in the SGR encoding. Taking the mouse costs the
+/// terminal's own text selection, which then needs Shift held.
+pub const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+pub const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 const RESET_MODES: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?2026l\x1b[?25h\x1b[0m";
 
@@ -58,6 +62,7 @@ pub fn run(
     if keyboard {
         execute!(out, PopKeyboardEnhancementFlags)?;
     }
+    out.write_all(MOUSE_OFF)?;
     execute!(
         out,
         DisableFocusChange,
@@ -81,6 +86,7 @@ pub fn run(
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
+    out.write_all(MOUSE_ON)?;
     execute!(out, EnableFocusChange, EnableBracketedPaste)?;
     terminal.clear()?;
     outcome
@@ -88,7 +94,9 @@ pub fn run(
 
 fn mirror(cmd: Command, done: &dyn Fn() -> bool, output: &mut Output) -> Result<Outcome> {
     let size = window_size(libc::STDIN_FILENO);
-    let (mut child, master) = spawn(cmd, size).context("could not run `claude`")?;
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let (mut child, master) =
+        spawn(cmd, size).with_context(|| format!("could not run `{program}`"))?;
     let handler = on_winch as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
     let previous = unsafe { libc::signal(libc::SIGWINCH, handler) };
     let outcome = proxy(
@@ -203,7 +211,7 @@ fn proxy(
                     return Ok(Outcome::Ended);
                 }
                 Err(err) if retryable(&err) => {}
-                Err(err) => return Err(err).context("reading from `claude`"),
+                Err(err) => return Err(err).context("reading from the program"),
             }
         }
         if fds[0].revents != 0 {

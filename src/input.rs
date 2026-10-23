@@ -9,7 +9,7 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-use crate::edit::TextField;
+use crate::edit::{Spot, TextField};
 
 const CURSOR_BAR: &str = "▏";
 
@@ -57,7 +57,7 @@ impl<'a> Input<'a> {
 
     /// The lines to draw in `width` cells, and the cursor's position among them.
     pub fn lines(&self, width: u16) -> (Vec<Line<'a>>, Position) {
-        let indent = self.prefix.iter().map(Span::width).sum::<usize>();
+        let indent = self.indent();
         let gutter = |n: usize| match n {
             0 => self.prefix.clone(),
             _ => vec![Span::raw(" ".repeat(indent))],
@@ -68,16 +68,9 @@ impl<'a> Input<'a> {
             spans.push(Span::raw(self.placeholder).dim());
             return (vec![Line::from(spans)], at(0, 0));
         }
-        // One cell is kept free so the cursor fits after the last character.
-        let layout = self
-            .field
-            .layout((width as usize).saturating_sub(indent + 1));
+        let layout = self.field.layout(self.text_width(width));
         let (row, col) = layout.cursor;
-        let skip = layout
-            .lines
-            .len()
-            .saturating_sub(self.max_lines)
-            .min((row + 1).saturating_sub(self.max_lines));
+        let skip = self.skip(layout.lines.len(), row);
         let lines = layout
             .lines
             .into_iter()
@@ -94,6 +87,39 @@ impl<'a> Input<'a> {
             })
             .collect();
         (lines, at(row - skip, col))
+    }
+
+    /// Where `at`, a spot on screen, falls in the field when it's drawn in `area`, for
+    /// `TextField::click`.
+    pub fn locate(&self, area: Rect, at: Position) -> Option<Spot> {
+        if !area.contains(at) {
+            return None;
+        }
+        let width = self.text_width(area.width);
+        let layout = self.field.layout(width);
+        let skip = self.skip(layout.lines.len(), layout.cursor.0);
+        Some(Spot {
+            width,
+            row: skip + (at.y - area.y) as usize,
+            col: ((at.x - area.x) as usize).saturating_sub(self.indent()),
+        })
+    }
+
+    fn indent(&self) -> usize {
+        self.prefix.iter().map(Span::width).sum()
+    }
+
+    // One cell is kept free so the cursor fits after the last character.
+    fn text_width(&self, width: u16) -> usize {
+        (width as usize).saturating_sub(self.indent() + 1)
+    }
+
+    // The first line shown: past `max_lines`, as few as possible are scrolled off the top
+    // while the cursor's row stays in view.
+    fn skip(&self, lines: usize, cursor_row: usize) -> usize {
+        lines
+            .saturating_sub(self.max_lines)
+            .min((cursor_row + 1).saturating_sub(self.max_lines))
     }
 
     pub fn height(&self, width: u16) -> u16 {

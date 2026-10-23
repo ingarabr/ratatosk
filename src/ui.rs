@@ -60,10 +60,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Layout::horizontal([Constraint::Length(MENU_WIDTH), Constraint::Fill(1)]).areas(body);
         draw_menu(frame, app, menu);
         draw_sessions(frame, app, list);
+        app.areas.menu = menu;
+        app.areas.list = list;
     } else {
         draw_sessions(frame, app, body);
+        app.areas.menu = Rect::default();
+        app.areas.list = body;
     }
-    draw_prompt(frame, app, prompt);
+    app.areas.prompt = draw_prompt(frame, app, prompt);
     draw_hints(frame, app, hints);
     if let Some(draft) = &app.draft {
         draw_draft(frame, app, draft);
@@ -74,6 +78,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(picker) = &app.picking_account {
         draw_accounts(frame, app, picker);
     }
+    app.areas.paste_view = draw_paste_view(frame, app);
 }
 
 fn draw_accounts(frame: &mut Frame, app: &App, picker: &AccountPicker) {
@@ -636,18 +641,128 @@ fn state_word(state: State) -> &'static str {
 
 const PROMPT_MAX_LINES: usize = 8;
 
-fn prompt_input(app: &App) -> Input<'_> {
+pub fn prompt_input(app: &App) -> Input<'_> {
     Input::new(&app.input)
         .prefix(Span::raw("❯ ").dim())
         .placeholder(PLACEHOLDER)
         .max_lines(PROMPT_MAX_LINES)
 }
 
-fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
+// Gives back where the text went, for clicks.
+fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     let block = Block::new().borders(Borders::TOP | Borders::BOTTOM).dim();
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    prompt_input(app).render(frame, inner, app.draft.is_none());
+    let focused = app.draft.is_none() && app.paste_view.is_none();
+    prompt_input(app).render(frame, inner, focused);
+    inner
+}
+
+const PASTE_VIEW_WIDTH: u16 = 110;
+
+// Draws the open paste, numbered and wrapped in full, and keeps its scroll in range. Gives
+// back where it went, for clicks.
+fn draw_paste_view(frame: &mut Frame, app: &mut App) -> Rect {
+    let Some(view) = app.paste_view else {
+        return Rect::default();
+    };
+    let text = app.input.pasted(view.paste);
+    let source: Vec<&str> = text.split('\n').collect();
+    let number_width = source.len().to_string().len();
+    let box_width = frame.area().width.min(PASTE_VIEW_WIDTH);
+    let room = (box_width as usize).saturating_sub(number_width + 5).max(1);
+    let mut rows: Vec<(usize, TextLine)> = Vec::new();
+    for (n, line) in source.iter().enumerate() {
+        let line = line.replace('\t', "    ");
+        let mut chunks = hard_wrap(&line, room).into_iter();
+        let first = chunks.next().unwrap_or_default();
+        rows.push((
+            n,
+            TextLine::from(vec![
+                Span::raw(format!(" {:>number_width$}  ", n + 1)).dim(),
+                Span::raw(first),
+            ]),
+        ));
+        for chunk in chunks {
+            rows.push((
+                n,
+                TextLine::from(vec![
+                    Span::raw(" ".repeat(number_width + 3)),
+                    Span::raw(chunk),
+                ]),
+            ));
+        }
+    }
+    let shown = rows
+        .len()
+        .min(frame.area().height.saturating_sub(7) as usize)
+        .max(1);
+    let scroll = view.scroll.min(rows.len().saturating_sub(shown));
+    if let Some(view) = app.paste_view.as_mut() {
+        view.scroll = scroll;
+    }
+    let visible = &rows[scroll..(scroll + shown).min(rows.len())];
+    let (first, last) = (
+        visible.first().map_or(0, |r| r.0),
+        visible.last().map_or(0, |r| r.0),
+    );
+    let mut lines: Vec<TextLine> = visible.iter().map(|(_, line)| line.clone()).collect();
+    lines.push(TextLine::default());
+    lines.push(
+        TextLine::from(format!(
+            " lines {}–{} of {} · ↑↓ or the wheel to scroll · pgup/pgdn · esc back",
+            first + 1,
+            last + 1,
+            source.len()
+        ))
+        .dim(),
+    );
+    lines.push(
+        TextLine::from(
+            " ⌫ removes it · enter puts it in the prompt as text · ctrl+g edits it in $EDITOR",
+        )
+        .dim(),
+    );
+    let title = format!(
+        " Pasted text #{} · {} lines · {} ",
+        view.paste + 1,
+        source.len(),
+        size(text.len())
+    );
+    let area = centered(frame.area(), box_width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(title.bold())
+                .border_style(Style::new().fg(Color::Cyan)),
+        ),
+        area,
+    );
+    area
+}
+
+// Cuts at exactly `width` cells, keeping every character, spaces included.
+fn hard_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut chunks = vec![String::new()];
+    let mut used = 0;
+    for c in text.chars() {
+        let w = text_width(c.encode_utf8(&mut [0; 4]));
+        if used + w > width && used > 0 {
+            chunks.push(String::new());
+            used = 0;
+        }
+        chunks.last_mut().unwrap().push(c);
+        used += w;
+    }
+    chunks
+}
+
+fn size(bytes: usize) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b => format!("{:.1} kB", b as f64 / 1024.0),
+    }
 }
 
 fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
@@ -679,9 +794,14 @@ fn draw_hints(frame: &mut Frame, app: &App, area: Rect) {
             "↑↓ to select · enter or → to attach · ←/→ on a group collapses/expands · tab for projects",
             "ctrl+a for accounts · ctrl+o to open · ctrl+l to move · ctrl+r to rename · ctrl+s to sort · ctrl+x to stop, twice to delete · esc to quit",
         ]
+    } else if app.input.paste_at_cursor().is_some() {
+        [
+            "ctrl+g or a click opens the pasted text to check it · enter to review and start",
+            "←→ move · opt+⌫ deletes the paste · ctrl+u/k delete to start/end · ctrl+y puts it back",
+        ]
     } else {
         [
-            "enter to review and start · shift+enter (or ctrl+j) for a new line · esc clears",
+            "enter to review and start · shift+enter (or ctrl+j) for a new line · ctrl+g opens $EDITOR · esc clears",
             "←→ move · opt+←→ by word · ctrl+a/e line start/end · opt+⌫ deletes a word · ctrl+u/k delete to start/end · ctrl+y puts it back",
         ]
     };
@@ -1043,7 +1163,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, widgets::TableState};
 
     use super::*;
-    use crate::agents::Session;
+    use crate::{agents::Session, app::Action};
 
     fn app() -> App {
         App {
@@ -1301,6 +1421,90 @@ mod tests {
             screen.contains("claude --bg \"fix the parser\""),
             "{screen}"
         );
+    }
+
+    // Draws a frame and gives the screen spot where `text` starts.
+    fn spot_of(app: &mut App, text: &str) -> (u16, u16) {
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        for y in 0..buffer.area.height {
+            let cells: Vec<&str> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            for x in 0..cells.len() {
+                if cells[x..].concat().starts_with(text) {
+                    return (x as u16, y);
+                }
+            }
+        }
+        panic!("{text:?} is not on screen");
+    }
+
+    fn click(app: &mut App, (column, row): (u16, u16), now: std::time::Instant) -> Action {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        app.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            now,
+        )
+    }
+
+    #[test]
+    fn a_click_selects_a_row_and_a_double_click_attaches() {
+        let mut app = app();
+        app.table.select(Some(0));
+        let at = spot_of(&mut app, "billing: credit-note");
+        let now = std::time::Instant::now();
+        assert!(matches!(click(&mut app, at, now), Action::None));
+        assert_eq!(app.table.selected(), Some(1));
+        let later = now + std::time::Duration::from_millis(100);
+        assert!(matches!(click(&mut app, at, later), Action::Attach { .. }));
+    }
+
+    #[test]
+    fn a_click_on_a_paste_opens_it_numbered_in_full() {
+        let mut app = app();
+        app.on_paste("why ");
+        let trace: Vec<String> = (1..=30).map(|n| format!("frame {n}")).collect();
+        app.on_paste(&trace.join("\n"));
+        let at = spot_of(&mut app, "[Pasted text #1 +30 lines]");
+        click(&mut app, (at.0 + 3, at.1), std::time::Instant::now());
+        assert!(app.paste_view.is_some());
+
+        let top = screen(&mut app);
+        assert!(top.contains("Pasted text #1 · 30 lines"), "{top}");
+        assert!(top.contains(" 1  frame 1"), "{top}");
+        assert!(!top.contains("frame 30"), "{top}");
+
+        app.paste_view.as_mut().unwrap().scroll = usize::MAX;
+        let bottom = screen(&mut app);
+        assert!(bottom.contains("30  frame 30"), "{bottom}");
+        assert!(bottom.contains("of 30"), "{bottom}");
+
+        click(&mut app, (0, 0), std::time::Instant::now());
+        assert!(app.paste_view.is_none());
+    }
+
+    #[test]
+    fn the_hint_says_how_to_open_the_paste_at_the_cursor() {
+        let mut app = app();
+        app.on_paste("a\nb\nc\nd");
+        let screen = screen(&mut app);
+        assert!(
+            screen.contains("ctrl+g or a click opens the pasted text"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn long_lines_are_wrapped_whole() {
+        assert_eq!(hard_wrap("ab  cd", 3), ["ab ", " cd"]);
+        assert_eq!(hard_wrap("", 3), [""]);
     }
 }
 

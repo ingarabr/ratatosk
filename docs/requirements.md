@@ -61,7 +61,7 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
     - `^S` switches grouping.
     - `^F` finds.
     - `^J` inserts a newline.
-    - `^G` opens the prompt in `$EDITOR`.
+    - `^G` opens the prompt in `$VISUAL` or `$EDITOR` (`vi` without either), run in Ratatosk's terminal like an attached session. Collapsed pastes go to the editor in full and collapse again if they come back unchanged. A detach key leaves the editor and keeps the prompt as it was. With the cursor next to a collapsed paste, `^G` opens the paste view instead.
     - Ctrl+Enter starts and attaches right away.
   - Ratatosk's own:
     - `^O` opens the session's folder (worktree or repo root) with a tool from the config's `openers`. Tools can be limited to folders with certain files at the top (`Cargo.toml`, `pom.xml`, `bleep.yaml`); one fitting tool opens directly, several open a chooser. The details band shows which tools fit.
@@ -77,6 +77,8 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
     - Cmd+⌫ and `^U` delete to the start of the line, `^K` to its end; at the edge of a line they join it to the next one. Ghostty sends Cmd+⌫ as `^U` by default, so both are handled. `^Y` puts back what was deleted last.
     - `^W` is not a word delete here, since it opens the PR, and `^B`, `^D`, `^F` and `^P` keep their own jobs.
 - Pasting never acts on what is pasted: Ratatosk turns on bracketed paste, so a newline in a paste is text, not Enter. A paste into the rename box or the project filter has its line breaks turned into spaces. As in the agents view, a paste longer than 800 characters or more than three lines collapses in the prompt to a `[Pasted text #N +L lines]` label, which the cursor and deletion treat as one character; the full text is sent on start. Pasting the same text again opens it up in place. The confirmation shows the label too.
+- The paste view checks a collapsed paste before it is sent. `^G` with the cursor next to a paste label, or a click on the label, opens it in a box over the list, like the confirmation: the whole paste, lines numbered, long lines wrapped rather than cut. ↑↓, PgUp/PgDn, Home/End and the wheel scroll; ⌫ removes the paste from the prompt; Enter puts it in the prompt as plain text; `^G` opens it in the editor; Esc or a click outside closes it. While the cursor is next to a paste, the hint line says how to open it.
+- The mouse: a click selects a session or group header, and a double click attaches or toggles the group, as Enter does. A click in the project menu picks that project. The wheel moves the selection in the list and the menu. A click in the prompt moves the cursor there. Ratatosk asks the terminal only for clicks and the wheel, never motion, and gives the mouse back while another program has the screen. Taking the mouse means the terminal's own text selection needs Shift held inside Ratatosk.
 - `?` with an empty prompt shows all keys.
 - The key hints sit in a grid below the prompt line, in the agents view's wording ("ctrl+r to rename").
 

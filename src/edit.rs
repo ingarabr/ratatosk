@@ -33,6 +33,20 @@ pub struct Piece {
     pub paste: bool,
 }
 
+/// A spot in a field's layout: the width it was laid out in, and a row and column in cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Spot {
+    pub width: usize,
+    pub row: usize,
+    pub col: usize,
+}
+
+struct Unit {
+    at: usize,
+    text: String,
+    paste: bool,
+}
+
 pub struct Layout {
     pub lines: Vec<Vec<Piece>>,
     /// Row and column of the cursor, in cells.
@@ -186,72 +200,24 @@ impl TextField {
     /// Lays the text out in `width` cells, wrapping at spaces and breaking words longer than a
     /// line, and says where the cursor lands.
     pub fn layout(&self, width: usize) -> Layout {
-        let width = width.max(1);
-        let mut lines: Vec<Vec<(usize, String, bool)>> = vec![Vec::new()];
-        let mut used = 0;
-        let mut word: Vec<(usize, String, bool)> = Vec::new();
-        let mut word_width = 0;
-        let flush = |lines: &mut Vec<Vec<(usize, String, bool)>>,
-                     used: &mut usize,
-                     word: &mut Vec<(usize, String, bool)>,
-                     word_width: &mut usize| {
-            if *used > 0 && *used + *word_width > width {
-                lines.push(Vec::new());
-                *used = 0;
-            }
-            for unit in word.drain(..) {
-                let w = cells(&unit.1);
-                if *used > 0 && *used + w > width {
-                    lines.push(Vec::new());
-                    *used = 0;
-                }
-                *used += w;
-                lines.last_mut().unwrap().push(unit);
-            }
-            *word_width = 0;
-        };
-        for (at, c) in self.text.char_indices() {
-            if c == '\n' {
-                flush(&mut lines, &mut used, &mut word, &mut word_width);
-                lines.last_mut().unwrap().push((at, String::new(), false));
-                lines.push(Vec::new());
-                used = 0;
-            } else if c == ' ' {
-                flush(&mut lines, &mut used, &mut word, &mut word_width);
-                used += 1;
-                lines.last_mut().unwrap().push((at, " ".into(), false));
-            } else {
-                let unit = match self.paste_index(c) {
-                    Some(i) => (at, self.label(i), true),
-                    None => (at, c.to_string(), false),
-                };
-                word_width += cells(&unit.1);
-                word.push(unit);
-            }
-        }
-        flush(&mut lines, &mut used, &mut word, &mut word_width);
-
-        let mut cursor = None;
-        for (row, line) in lines.iter().enumerate() {
-            let mut col = 0;
-            for (at, text, _) in line {
-                if *at == self.cursor {
-                    cursor = Some((row, col));
-                }
-                col += cells(text);
-            }
-        }
-        let cursor = cursor.unwrap_or_else(|| {
-            let last = lines
-                .last()
-                .map_or(0, |l| l.iter().map(|u| cells(&u.1)).sum());
-            (lines.len() - 1, last)
-        });
+        let lines = self.units(width);
+        let cursor = lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| {
+                let mut col = 0;
+                line.iter().find_map(|unit| {
+                    let found = (unit.at == self.cursor).then_some((row, col));
+                    col += cells(&unit.text);
+                    found
+                })
+            })
+            .unwrap_or_else(|| (lines.len() - 1, line_width(&lines[lines.len() - 1])));
         let lines = lines
             .into_iter()
             .map(|line| {
                 let mut pieces: Vec<Piece> = Vec::new();
-                for (_, text, paste) in line {
+                for Unit { text, paste, .. } in line {
                     match pieces.last_mut() {
                         Some(last) if last.paste == paste && !paste => last.text.push_str(&text),
                         _ => pieces.push(Piece { text, paste }),
@@ -262,6 +228,159 @@ impl TextField {
             })
             .collect();
         Layout { lines, cursor }
+    }
+
+    /// Moves the cursor to `spot`, and says which collapsed paste was there, if one was. A
+    /// spot past the end of a line lands at its end; on a wrapped line, before the space it
+    /// wrapped at.
+    pub fn click(&mut self, spot: Spot) -> Option<usize> {
+        let Spot { width, row, col } = spot;
+        let lines = self.units(width);
+        let line = lines.get(row).or(lines.last())?;
+        let mut left = 0;
+        for unit in line {
+            let w = cells(&unit.text);
+            if col < left + w.max(1) && !unit.text.is_empty() {
+                let c = self.text[unit.at..].chars().next()?;
+                let paste = self.paste_index(c);
+                let after = col >= left + w.div_ceil(2);
+                self.cursor = if paste.is_some() || after {
+                    unit.at + c.len_utf8()
+                } else {
+                    unit.at
+                };
+                return paste;
+            }
+            left += w;
+        }
+        self.cursor = match line.last() {
+            Some(unit) if unit.text.is_empty() || unit.text == " " => unit.at,
+            _ => lines
+                .get(row + 1)
+                .and_then(|next| next.first())
+                .map_or(self.text.len(), |unit| unit.at),
+        };
+        None
+    }
+
+    /// The collapsed paste right before the cursor, or else right after it.
+    pub fn paste_at_cursor(&self) -> Option<usize> {
+        let before = self.text[..self.cursor].chars().next_back();
+        let after = self.text[self.cursor..].chars().next();
+        [before, after]
+            .into_iter()
+            .flatten()
+            .find_map(|c| self.paste_index(c))
+    }
+
+    /// What collapsed paste `i` holds.
+    pub fn pasted(&self, i: usize) -> &str {
+        &self.pastes[i]
+    }
+
+    /// Whether collapsed paste `i` is still in the text.
+    pub fn has_paste(&self, i: usize) -> bool {
+        char::from_u32(PASTE_BASE + i as u32).is_some_and(|c| self.text.contains(c))
+    }
+
+    /// Takes collapsed paste `i` out of the text.
+    pub fn remove_paste(&mut self, i: usize) {
+        self.splice_paste(i, "");
+    }
+
+    /// Puts what paste `i` holds into the text in place of its label.
+    pub fn inline_paste(&mut self, i: usize) {
+        self.splice_paste(i, &self.pastes[i].replace('\t', TAB));
+    }
+
+    /// Gives collapsed paste `i` new contents; with none left it goes from the text too.
+    pub fn replace_paste(&mut self, i: usize, text: &str) {
+        let text = clean(text, true);
+        if text.trim().is_empty() {
+            self.remove_paste(i);
+        } else {
+            self.pastes[i] = text;
+        }
+    }
+
+    /// Replaces the text with `text`, which holds the pastes in full, as from `expanded`. Each
+    /// paste still found whole in it is collapsed again. The cursor goes to the end.
+    pub fn set_expanded(&mut self, text: &str) {
+        let mut text = clean(text, self.multiline);
+        if !self.multiline {
+            text = flatten(&text);
+        }
+        let mut order: Vec<usize> = (0..self.pastes.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(self.pastes[i].len()));
+        for i in order {
+            let c = char::from_u32(PASTE_BASE + i as u32).expect("in the private-use range");
+            if !self.pastes[i].is_empty() && text.contains(&self.pastes[i]) {
+                text = text.replacen(&self.pastes[i], c.encode_utf8(&mut [0; 4]), 1);
+            }
+        }
+        self.text = text;
+        self.cursor = self.text.len();
+    }
+
+    fn splice_paste(&mut self, i: usize, with: &str) {
+        let Some(c) = char::from_u32(PASTE_BASE + i as u32) else {
+            return;
+        };
+        let Some(at) = self.text.find(c) else {
+            return;
+        };
+        let end = at + c.len_utf8();
+        self.text.replace_range(at..end, with);
+        if self.cursor >= end {
+            self.cursor = self.cursor - (end - at) + with.len();
+        } else if self.cursor > at {
+            self.cursor = at;
+        }
+    }
+
+    // The text cut into drawn lines of units: one character, a space, a collapsed paste's
+    // label, or an empty unit for a line break.
+    fn units(&self, width: usize) -> Vec<Vec<Unit>> {
+        let width = width.max(1);
+        let mut lines: Vec<Vec<Unit>> = vec![Vec::new()];
+        let mut used = 0;
+        let mut word: Vec<Unit> = Vec::new();
+        let flush = |lines: &mut Vec<Vec<Unit>>, used: &mut usize, word: &mut Vec<Unit>| {
+            let word_width: usize = word.iter().map(|u| cells(&u.text)).sum();
+            if *used > 0 && *used + word_width > width {
+                lines.push(Vec::new());
+                *used = 0;
+            }
+            for unit in word.drain(..) {
+                let w = cells(&unit.text);
+                if *used > 0 && *used + w > width {
+                    lines.push(Vec::new());
+                    *used = 0;
+                }
+                *used += w;
+                lines.last_mut().unwrap().push(unit);
+            }
+        };
+        for (at, c) in self.text.char_indices() {
+            let unit = |text: String, paste| Unit { at, text, paste };
+            if c == '\n' {
+                flush(&mut lines, &mut used, &mut word);
+                lines.last_mut().unwrap().push(unit(String::new(), false));
+                lines.push(Vec::new());
+                used = 0;
+            } else if c == ' ' {
+                flush(&mut lines, &mut used, &mut word);
+                used += 1;
+                lines.last_mut().unwrap().push(unit(" ".into(), false));
+            } else {
+                word.push(match self.paste_index(c) {
+                    Some(i) => unit(self.label(i), true),
+                    None => unit(c.to_string(), false),
+                });
+            }
+        }
+        flush(&mut lines, &mut used, &mut word);
+        lines
     }
 
     fn shown_from(&self, text: &str) -> String {
@@ -394,6 +513,10 @@ fn clean(text: &str, lines: bool) -> String {
 fn flatten(text: &str) -> String {
     let text = clean(text, true);
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn line_width(line: &[Unit]) -> usize {
+    line.iter().map(|u| cells(&u.text)).sum()
 }
 
 fn cells(text: &str) -> usize {
@@ -592,6 +715,85 @@ mod tests {
         ));
         f.insert_char('\n');
         assert_eq!(marked(&f), "na mecredit notes x x x|");
+    }
+
+    fn with_trace(before: &str) -> TextField {
+        let mut f = field(before);
+        f.paste("a\nb\nc\nd");
+        f
+    }
+
+    #[test]
+    fn the_paste_at_the_cursor_is_found_on_either_side() {
+        let mut f = with_trace("see |");
+        assert_eq!(f.paste_at_cursor(), Some(0));
+        f.apply(key(KeyCode::Left));
+        assert_eq!(f.paste_at_cursor(), Some(0));
+        f.apply(key(KeyCode::Left));
+        assert_eq!(f.paste_at_cursor(), None);
+    }
+
+    #[test]
+    fn a_paste_can_be_removed_put_inline_or_given_new_contents() {
+        let mut f = with_trace("see |");
+        f.insert(" now");
+        f.replace_paste(0, "x\ny\nz\nw\nv");
+        assert_eq!(f.expanded(), "see x\ny\nz\nw\nv now");
+
+        let mut inline = f.clone();
+        inline.inline_paste(0);
+        assert_eq!(marked(&inline), "see x\ny\nz\nw\nv now|");
+
+        f.remove_paste(0);
+        assert_eq!(marked(&f), "see  now|");
+        assert!(!f.has_paste(0));
+
+        let mut emptied = with_trace("see |");
+        emptied.replace_paste(0, "  \n");
+        assert_eq!(marked(&emptied), "see |");
+    }
+
+    #[test]
+    fn text_back_from_the_editor_keeps_whole_pastes_collapsed() {
+        let mut f = with_trace("see |");
+        f.set_expanded("look at a\nb\nc\nd please\n");
+        assert_eq!(marked(&f), "look at [Pasted text #1 +4 lines] please\n|");
+
+        f.set_expanded("look at a\nB\nc\nd");
+        assert_eq!(f.shown(), "look at a\nB\nc\nd");
+    }
+
+    #[test]
+    fn a_click_moves_the_cursor_and_names_a_paste_it_lands_on() {
+        let mut f = with_trace("see |");
+        f.insert(" now");
+        let spot = |row, col| Spot {
+            width: 80,
+            row,
+            col,
+        };
+        assert_eq!(f.click(spot(0, 1)), None);
+        assert_eq!(marked(&f), "s|ee [Pasted text #1 +4 lines] now");
+        assert_eq!(f.click(spot(0, 2)), None);
+        assert_eq!(marked(&f), "se|e [Pasted text #1 +4 lines] now");
+        assert_eq!(f.click(spot(0, 10)), Some(0));
+        assert_eq!(marked(&f), "see [Pasted text #1 +4 lines]| now");
+        assert_eq!(f.click(spot(0, 70)), None);
+        assert_eq!(marked(&f), "see [Pasted text #1 +4 lines] now|");
+
+        let mut lines = field("one\ntwo|");
+        lines.click(spot(0, 40));
+        assert_eq!(marked(&lines), "one|\ntwo");
+        lines.click(spot(5, 0));
+        assert_eq!(marked(&lines), "one\n|two");
+
+        let mut wrapped = field("fix the parser|");
+        wrapped.click(Spot {
+            width: 9,
+            row: 0,
+            col: 8,
+        });
+        assert_eq!(marked(&wrapped), "fix the| parser");
     }
 
     #[test]

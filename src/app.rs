@@ -6,7 +6,8 @@ use std::{
 };
 
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    layout::{Position, Rect},
     widgets::TableState,
 };
 
@@ -32,6 +33,7 @@ use crate::{
 const RECENT_SHOWN: usize = 6;
 const DELETE_WINDOW: Duration = Duration::from_secs(2);
 const PR_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Focus {
@@ -43,6 +45,30 @@ pub enum Focus {
 pub enum Line {
     Header(String),
     Session(usize),
+}
+
+/// What `^G` hands to the editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Editing {
+    Prompt,
+    Paste(usize),
+}
+
+/// A collapsed paste of the prompt, open for reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasteView {
+    pub paste: usize,
+    /// The first drawn row shown; the drawing keeps it in range.
+    pub scroll: usize,
+}
+
+/// Where the last frame put what a click can land on.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Areas {
+    pub list: Rect,
+    pub menu: Rect,
+    pub prompt: Rect,
+    pub paste_view: Rect,
 }
 
 pub enum Action {
@@ -77,6 +103,7 @@ pub enum Action {
     Move(Move),
     SwitchAccount(String),
     SignIn,
+    Edit(Editing),
 }
 
 // A session that runs on the wrong account, to be resumed on the one its org is pinned to.
@@ -131,6 +158,9 @@ pub struct App {
     pub pool: Option<Pool>,
     pub signed_in: Option<Member>,
     pub picking_account: Option<AccountPicker>,
+    pub paste_view: Option<PasteView>,
+    pub areas: Areas,
+    pub last_click: Option<(usize, Instant)>,
 }
 
 // The pool's accounts, then a row to sign in to another one.
@@ -190,6 +220,9 @@ impl App {
             pool,
             signed_in: None,
             picking_account: None,
+            paste_view: None,
+            areas: Areas::default(),
+            last_click: None,
         };
         app.refresh();
         app
@@ -251,6 +284,9 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         self.status = None;
+        if self.paste_view.is_some() {
+            return self.on_paste_view_key(key);
+        }
         if self.renaming.is_some() {
             self.on_rename_key(key);
             return Action::None;
@@ -294,6 +330,10 @@ impl App {
         match key.code {
             KeyCode::Left if self.input.is_empty() => self.list_left(),
             KeyCode::Char('c') if ctrl => return Action::Quit,
+            KeyCode::Char('g') if ctrl => match self.input.paste_at_cursor() {
+                Some(paste) => self.paste_view = Some(PasteView { paste, scroll: 0 }),
+                None => return Action::Edit(Editing::Prompt),
+            },
             KeyCode::Char('x') if ctrl => return self.stop_or_delete(Instant::now()),
             KeyCode::Char('o') if ctrl => return self.open_selected(),
             KeyCode::Char('l') if ctrl => return self.move_selected(),
@@ -339,6 +379,128 @@ impl App {
         Action::None
     }
 
+    fn on_paste_view_key(&mut self, key: KeyEvent) -> Action {
+        let Some(view) = self.paste_view.as_mut() else {
+            return Action::None;
+        };
+        let page = self.areas.paste_view.height.saturating_sub(5).max(1) as usize;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.paste_view = None,
+            KeyCode::Char('c') if ctrl => self.paste_view = None,
+            KeyCode::Char('g') if ctrl => return Action::Edit(Editing::Paste(view.paste)),
+            KeyCode::Up => view.scroll = view.scroll.saturating_sub(1),
+            KeyCode::Down => view.scroll += 1,
+            KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(page),
+            KeyCode::PageDown | KeyCode::Char(' ') => view.scroll += page,
+            KeyCode::Home => view.scroll = 0,
+            KeyCode::End => view.scroll = usize::MAX,
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.input.remove_paste(view.paste);
+                self.paste_view = None;
+            }
+            KeyCode::Enter => {
+                self.input.inline_paste(view.paste);
+                self.paste_view = None;
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Takes back what the editor saved.
+    pub fn edited(&mut self, editing: Editing, saved: &str) {
+        match editing {
+            Editing::Prompt => self.input.set_expanded(saved),
+            Editing::Paste(i) => {
+                self.input.replace_paste(i, saved);
+                if !self.input.has_paste(i) {
+                    self.paste_view = None;
+                }
+            }
+        }
+    }
+
+    /// Clicks and the wheel. A click on a session selects it and a double click attaches, as
+    /// Enter would; a click on a collapsed paste in the prompt opens it.
+    pub fn on_mouse(&mut self, mouse: MouseEvent, now: Instant) -> Action {
+        let at = Position::new(mouse.column, mouse.row);
+        let up = match mouse.kind {
+            MouseEventKind::ScrollUp => true,
+            MouseEventKind::ScrollDown => false,
+            MouseEventKind::Down(MouseButton::Left) => return self.on_click(at, now),
+            _ => return Action::None,
+        };
+        let direction = if up { -1 } else { 1 };
+        if let Some(view) = self.paste_view.as_mut() {
+            view.scroll = view.scroll.saturating_add_signed(direction * 3);
+        } else if !self.overlay_open() && self.areas.menu.contains(at) {
+            return self.step_scope(direction);
+        } else if !self.overlay_open() && self.areas.list.contains(at) {
+            self.step(direction, 1);
+        }
+        Action::None
+    }
+
+    fn on_click(&mut self, at: Position, now: Instant) -> Action {
+        if self.paste_view.is_some() {
+            if !self.areas.paste_view.contains(at) {
+                self.paste_view = None;
+            }
+            return Action::None;
+        }
+        if self.overlay_open() {
+            return Action::None;
+        }
+        self.status = None;
+        if self.areas.prompt.contains(at) {
+            let spot = crate::ui::prompt_input(self).locate(self.areas.prompt, at);
+            if let Some(paste) = spot.and_then(|spot| self.input.click(spot)) {
+                self.paste_view = Some(PasteView { paste, scroll: 0 });
+            }
+        } else if self.areas.menu.contains(at) {
+            let row = (at.y - self.areas.menu.y) as usize;
+            let visible = self.visible_scopes();
+            if let Some(scope) = row.checked_sub(1).and_then(|n| visible.get(n)) {
+                self.scope = (*scope).clone();
+                self.focus = Focus::Menu;
+                let keep = self.selected_session().map(|s| s.id.clone());
+                self.layout(keep.as_deref());
+            }
+        } else if self.areas.list.contains(at) {
+            let row = (at.y - self.areas.list.y) as usize;
+            let Some(line) = row
+                .checked_sub(1)
+                .map(|n| n + self.table.offset())
+                .filter(|&n| n < self.lines.len())
+            else {
+                return Action::None;
+            };
+            self.focus = Focus::List;
+            self.table.select(Some(line));
+            let double = matches!(self.last_click, Some((last, when)) if last == line && now.duration_since(when) < DOUBLE_CLICK);
+            if double {
+                self.last_click = None;
+                return match self.selected_index() {
+                    Some(_) => self.attach_selected(),
+                    None => {
+                        self.toggle_group();
+                        Action::None
+                    }
+                };
+            }
+            self.last_click = Some((line, now));
+        }
+        Action::None
+    }
+
+    fn overlay_open(&self) -> bool {
+        self.draft.is_some()
+            || self.choosing.is_some()
+            || self.picking_account.is_some()
+            || self.renaming.is_some()
+    }
+
     /// Text pasted through bracketed paste: it is only ever typed in, never acted on.
     pub fn on_paste(&mut self, text: &str) {
         self.status = None;
@@ -348,7 +510,10 @@ impl App {
             if draft.field == Field::Project {
                 draft.picker.paste(&self.repos, text);
             }
-        } else if self.choosing.is_none() && self.picking_account.is_none() {
+        } else if self.choosing.is_none()
+            && self.picking_account.is_none()
+            && self.paste_view.is_none()
+        {
             self.input.paste(text);
         }
     }
@@ -1930,6 +2095,61 @@ mod prompt_tests {
         app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(app.input.text(), "a\nb\n");
         assert!(app.draft.is_none());
+    }
+
+    fn with_paste() -> App {
+        let mut app = App::default();
+        app.on_paste("why ");
+        app.on_paste("panic\n  at a\n  at b\n  at c");
+        app
+    }
+
+    fn ctrl_g(app: &mut App) -> Action {
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn ctrl_g_opens_the_paste_at_the_cursor_and_otherwise_the_editor() {
+        let mut app = with_paste();
+        assert!(matches!(ctrl_g(&mut app), Action::None));
+        assert_eq!(
+            app.paste_view,
+            Some(PasteView {
+                paste: 0,
+                scroll: 0
+            })
+        );
+        assert!(matches!(ctrl_g(&mut app), Action::Edit(Editing::Paste(0))));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.paste_view.is_none());
+        assert!(!app.input.is_empty());
+
+        app.on_key(KeyEvent::from(KeyCode::Char('!')));
+        assert!(matches!(ctrl_g(&mut app), Action::Edit(Editing::Prompt)));
+    }
+
+    #[test]
+    fn the_paste_view_removes_the_paste_or_puts_it_inline() {
+        let mut app = with_paste();
+        ctrl_g(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.paste_view.is_none());
+        assert_eq!(app.input.shown(), "why panic\n  at a\n  at b\n  at c");
+
+        let mut app = with_paste();
+        ctrl_g(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert!(app.paste_view.is_none());
+        assert_eq!(app.input.shown(), "why ");
+    }
+
+    #[test]
+    fn what_the_editor_saved_replaces_the_prompt_or_the_paste() {
+        let mut app = with_paste();
+        app.edited(Editing::Paste(0), "only\nthis\nis\nleft");
+        assert_eq!(app.input.expanded(), "why only\nthis\nis\nleft");
+        app.edited(Editing::Prompt, "rewritten");
+        assert_eq!(app.input.expanded(), "rewritten");
     }
 
     #[test]
