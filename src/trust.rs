@@ -16,10 +16,11 @@ struct ProjectConfig {
     trusted: bool,
 }
 
-// Whether Claude Code's trust prompt was accepted for this folder; `claude --bg` refuses to
-// start in one that wasn't, and a trusted parent folder doesn't count. A worktree is trusted
-// through its main checkout: Claude Code files the answer there. Each account keeps its own
-// answers. None when the account's .claude.json can't be read.
+// Whether Claude Code trusts this folder: its trust prompt was accepted there or in a folder
+// above it. Claude Code asks nothing in a folder under a trusted one, so waiting for an answer
+// filed for the folder itself would wait forever. A worktree is also trusted through its main
+// checkout, where Claude Code files the answer. Each account keeps its own answers. None when
+// the account's .claude.json can't be read.
 pub fn is_trusted(account: &Account, dir: &Path) -> Option<bool> {
     let bytes = fs::read(account.global_config()).ok()?;
     Some(
@@ -29,14 +30,15 @@ pub fn is_trusted(account: &Account, dir: &Path) -> Option<bool> {
 }
 
 fn trusted_in(config: &[u8], dir: &Path) -> bool {
-    serde_json::from_slice::<ClaudeConfig>(config)
-        .ok()
-        .and_then(|c| {
-            c.projects
-                .get(dir.to_string_lossy().as_ref())
-                .map(|p| p.trusted)
-        })
-        .unwrap_or(false)
+    let Ok(config) = serde_json::from_slice::<ClaudeConfig>(config) else {
+        return false;
+    };
+    dir.ancestors().any(|dir| {
+        config
+            .projects
+            .get(dir.to_string_lossy().as_ref())
+            .is_some_and(|p| p.trusted)
+    })
 }
 
 pub fn is_trust_error(message: &str) -> bool {
@@ -48,20 +50,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_folders_with_an_accepted_prompt_are_trusted() {
+    fn a_folder_is_trusted_when_it_or_a_folder_above_it_was_accepted() {
         let config = br#"{
             "projects": {
                 "/p": { "hasTrustDialogAccepted": true },
-                "/p/acme/billing": { "hasTrustDialogAccepted": true },
-                "/p/acme/admin": { "hasTrustDialogAccepted": false }
+                "/q/acme/billing": { "hasTrustDialogAccepted": true },
+                "/q/acme/admin": { "hasTrustDialogAccepted": false }
             },
             "otherSetting": 1
         }"#;
-        assert!(trusted_in(config, Path::new("/p/acme/billing")));
-        assert!(!trusted_in(config, Path::new("/p/acme/admin")));
+        assert!(trusted_in(config, Path::new("/q/acme/billing")));
+        assert!(trusted_in(config, Path::new("/q/acme/billing/sub")));
+        assert!(!trusted_in(config, Path::new("/q/acme/admin")));
+        assert!(!trusted_in(config, Path::new("/q/acme/new")));
         assert!(
-            !trusted_in(config, Path::new("/p/acme/new")),
-            "a trusted parent does not count"
+            trusted_in(config, Path::new("/p/ingarabr/new")),
+            "Claude Code asks nothing under a trusted folder, even where it filed `false`"
         );
     }
 

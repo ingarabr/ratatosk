@@ -302,6 +302,9 @@ fn start(
 // An interactive `claude` in the folder, only so its trust prompt can be answered: it is closed
 // as soon as the folder is trusted, and the caller then starts the real session.
 fn run_claude_in(terminal: &mut DefaultTerminal, account: &Account, dir: &Path) -> Result<()> {
+    if trust::is_trusted(account, dir) == Some(true) {
+        return Ok(());
+    }
     let mut cmd = account.claude();
     cmd.current_dir(dir);
     log::info(format!(
