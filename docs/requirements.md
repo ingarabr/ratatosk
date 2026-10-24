@@ -175,6 +175,10 @@ Ratatosk copies the agents view's keys wherever the agents view has one. The age
   - A mod loaded into the session does run inside `claude attach` and can swallow `/exit` through a `command.run` hook (verified 2026-10-09), so a later step can make `/exit` return to Ratatosk too. Mods cannot see keys or ←.
 - Call `gh` and `git` as commands.
 
+## Logging
+
+- Ratatosk appends to `~/.local/state/ratatosk/ratatosk.log` (under `$XDG_STATE_HOME` when set): every error it shows or swallows, panics, and each session start, attach and trust step, with the command's exit status and output. A start records the prompt's size and line count, never its text. The log moves to `ratatosk.log.1` once it passes 1 MB.
+
 ## Ground rules
 
 - Ratatosk never pushes, never force-pushes and never creates tags. Those decisions stay with the user.

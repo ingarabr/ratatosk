@@ -12,6 +12,7 @@ mod input;
 mod keychain;
 mod launch;
 mod lockfile;
+mod log;
 mod names;
 mod open;
 mod picker;
@@ -69,9 +70,14 @@ fn main() -> Result<()> {
         return print_list(app);
     }
     app.sync_pool();
+    log::rotate();
     let mut terminal = init()?;
+    log::on_panic();
     let result = run(&mut terminal, app);
     restore();
+    if let Err(err) = &result {
+        log::failed("ratatosk stopped", err);
+    }
     result
 }
 
@@ -156,7 +162,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                     let account = app.accounts.get(launch.account).clone();
                     if let Err(err) = logged_in(&account) {
                         if let Some(draft) = app.draft.as_mut() {
-                            draft.notice = Some(format!("{err:#}"));
+                            draft.notice = Some(log::failed("start", &err));
                         }
                         continue;
                     }
@@ -173,21 +179,21 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                             planned.name,
                             app.accounts.get(planned.to).name
                         ),
-                        Err(err) => format!("{err:#}"),
+                        Err(err) => log::failed("move", &err),
                     });
                     app.refresh();
                 }
                 Action::SwitchAccount(email) => {
                     app.status = Some(match switch_account(&mut app, &email) {
                         Ok(message) => message,
-                        Err(err) => format!("{err:#}"),
+                        Err(err) => log::failed("switch account", &err),
                     });
                     app.refresh();
                 }
                 Action::SignIn => {
                     app.status = Some(match sign_in(terminal, &mut app) {
                         Ok(message) => message,
-                        Err(err) => format!("{err:#}"),
+                        Err(err) => log::failed("sign in", &err),
                     });
                     app.refresh();
                 }
@@ -197,7 +203,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                             app.armed_delete = Some((id.clone(), std::time::Instant::now()));
                             format!("stopped {id} · ctrl+x again within 2s to delete it")
                         }
-                        Err(err) => format!("{err:#}"),
+                        Err(err) => log::failed("stop", &err),
                     });
                     app.refresh();
                 }
@@ -205,7 +211,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                     app.status = Some(match agents::remove(app.accounts.get(account), &id) {
                         Ok(out) if out.is_empty() => format!("deleted {id}"),
                         Ok(out) => out,
-                        Err(err) => format!("{err:#}"),
+                        Err(err) => log::failed("delete", &err),
                     });
                     app.refresh();
                 }
@@ -216,7 +222,7 @@ fn run(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
                             place::tilde(&dir),
                             app.openers[opener].name
                         ),
-                        Err(err) => format!("{err:#}"),
+                        Err(err) => log::failed("open", &err),
                     });
                 }
                 Action::Edit(editing) => edit_text(terminal, &mut app, editing)?,
@@ -234,7 +240,7 @@ fn edit_text(terminal: &mut DefaultTerminal, app: &mut App, editing: Editing) ->
     match editor::edit(terminal, &text, keyboard_enhanced()) {
         Ok(Some(saved)) => app.edited(editing, &saved),
         Ok(None) => app.status = Some("left the editor; nothing changed".to_string()),
-        Err(err) => app.status = Some(format!("{err:#}")),
+        Err(err) => app.status = Some(log::failed("edit in $EDITOR", &err)),
     }
     Ok(())
 }
@@ -254,7 +260,7 @@ fn start(
     let account = app.accounts.get(launch.account).clone();
     if let Err(err) = logged_in(&account) {
         if let Some(draft) = app.draft.as_mut() {
-            draft.notice = Some(format!("{err:#}"));
+            draft.notice = Some(log::failed("start", &err));
         }
         return Ok(());
     }
@@ -279,10 +285,14 @@ fn start(
                 app.refresh();
             }
         }
-        Err(err) if trust::is_trust_error(&format!("{err:#}")) => refused(app, ask),
+        Err(err) if trust::is_trust_error(&format!("{err:#}")) => {
+            log::failed("start, folder not trusted", &err);
+            refused(app, ask)
+        }
         Err(err) => {
+            let shown = log::failed("start", &err);
             if let Some(draft) = app.draft.as_mut() {
-                draft.notice = Some(format!("{err:#}"));
+                draft.notice = Some(shown);
             }
         }
     }
@@ -294,12 +304,21 @@ fn start(
 fn run_claude_in(terminal: &mut DefaultTerminal, account: &Account, dir: &Path) -> Result<()> {
     let mut cmd = account.claude();
     cmd.current_dir(dir);
-    handoff::run(
+    log::info(format!(
+        "trust: opening claude in {} ({} account) to answer its trust prompt",
+        dir.display(),
+        account.name
+    ));
+    let outcome = handoff::run(
         terminal,
         cmd,
         || trust::is_trusted(account, dir) == Some(true),
         keyboard_enhanced(),
     )?;
+    log::info(format!(
+        "trust: claude closed ({outcome:?}); trusted now: {:?}",
+        trust::is_trusted(account, dir)
+    ));
     Ok(())
 }
 
@@ -308,7 +327,13 @@ fn run_claude_in(terminal: &mut DefaultTerminal, account: &Account, dir: &Path) 
 fn attach(terminal: &mut DefaultTerminal, account: &Account, id: &str, dir: &Path) -> Result<()> {
     let mut cmd = account.claude();
     cmd.args(["attach", id]).current_dir(dir);
-    handoff::run(terminal, cmd, || false, keyboard_enhanced())?;
+    log::info(format!(
+        "attach {id} in {} ({} account)",
+        dir.display(),
+        account.name
+    ));
+    let outcome = handoff::run(terminal, cmd, || false, keyboard_enhanced())?;
+    log::info(format!("attach {id}: back ({outcome:?})"));
     Ok(())
 }
 

@@ -260,7 +260,11 @@ impl App {
             }
             self.sessions = sessions;
         }
-        self.error = (!errors.is_empty()).then(|| errors.join(" · "));
+        let error = (!errors.is_empty()).then(|| errors.join(" · "));
+        if let Some(error) = error.as_ref().filter(|&e| self.error.as_ref() != Some(e)) {
+            crate::log::error("list sessions", error);
+        }
+        self.error = error;
         self.signed_in = self.pool.as_ref().and_then(Pool::active);
         self.rebuild(keep.as_deref());
     }
@@ -654,6 +658,7 @@ impl App {
             && let Err(err) = names::save(path, &self.names)
         {
             self.error = Some(format!("could not save names: {err}"));
+            crate::log::error("save", &err);
         }
         self.layout(Some(id));
     }
@@ -864,7 +869,7 @@ impl App {
                 }
                 self.status = Some(match pool.forget(&Keychain, &email) {
                     Ok(()) => format!("forgot {email}; Claude Code's own sign-in is unchanged"),
-                    Err(err) => format!("{err:#}"),
+                    Err(err) => crate::log::failed("forget sign-in", &err),
                 });
                 picker.cursor = picker.cursor.min(pool.members.len());
             }
@@ -892,6 +897,7 @@ impl App {
             && let Err(err) = carried::save(path, &self.carried)
         {
             self.error = Some(format!("could not save the moved session's PRs: {err}"));
+            crate::log::error("save", &err);
         }
     }
 
@@ -905,6 +911,7 @@ impl App {
             && let Err(err) = names::save(path, &self.names)
         {
             self.error = Some(format!("could not save names: {err}"));
+            crate::log::error("save", &err);
         }
     }
 
@@ -1212,6 +1219,7 @@ impl App {
             && let Err(err) = self.view.save(path)
         {
             self.error = Some(format!("could not save the view settings: {err}"));
+            crate::log::error("save", &err);
         }
     }
 

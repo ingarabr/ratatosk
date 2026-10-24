@@ -359,6 +359,17 @@ impl Launch {
             .current_dir(&self.dir)
             .output()
             .context("could not run `claude --bg`")?;
+        crate::log::info(format!(
+            "start in {} ({} account): {} · prompt {} chars, {} lines · {}\nstdout: {}\nstderr: {}",
+            self.dir.display(),
+            account.name,
+            self.args()[..self.args().len() - 1].join(" "),
+            self.prompt.chars().count(),
+            self.prompt.lines().count(),
+            out.status,
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
         ensure!(
             out.status.success(),
             "`claude --bg` failed: {}",
